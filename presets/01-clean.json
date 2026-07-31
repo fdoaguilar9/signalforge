@@ -1,0 +1,15 @@
+{
+  "chain": [
+    {
+      "bypassed": false,
+      "controls": {
+        "input_level": 0.0,
+        "output_level": 0.0,
+        "quality_scale": 1.0
+      },
+      "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://github.com/mikeoliphant/neural-amp-modeler-lv2> ;\n\tstate:state [\n\t\t<http://github.com/mikeoliphant/neural-amp-modeler-lv2#model> <file:///home/fernando/Downloads/Mesa%20Boogie%20JP-2C%20Pack!/JP2C%20Capture%2016%20Clean%20CH1%20G6%20T6%20M1%20B4%20P6%20-%20Emil%20Rohbe.nam>\n\t] .\n",
+      "uri": "http://github.com/mikeoliphant/neural-amp-modeler-lv2"
+    }
+  ],
+  "name": "Clean"
+}

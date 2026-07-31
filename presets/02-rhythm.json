@@ -1,0 +1,26 @@
+{
+  "chain": [
+    {
+      "bypassed": false,
+      "controls": {
+        "input_level": 0.0,
+        "output_level": -3.0,
+        "quality_scale": 1.0
+      },
+      "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://github.com/mikeoliphant/neural-amp-modeler-lv2> ;\n\tstate:state [\n\t\t<http://github.com/mikeoliphant/neural-amp-modeler-lv2#model> <file:///home/fernando/Downloads/Mesa%20Boogie%20JP-2C%20Pack!/JP2C%20Capture%2013%20JP%20RHY%20CH2%20G8%20T6%20M4%20B3%20P6%20-%20Emil%20Rohbe.nam>\n\t] .\n",
+      "uri": "http://github.com/mikeoliphant/neural-amp-modeler-lv2"
+    },
+    {
+      "bypassed": false,
+      "controls": {
+        "buffered": 1.0,
+        "dry": -60.0,
+        "enable": 1.0,
+        "wet": 0.0
+      },
+      "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://gareus.org/oss/lv2/zeroconvolv#CfgMono> ;\n\tstate:state [\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#channel_predelay> [\n\t\t\ta atom:Vector ;\n\t\t\tatom:childType atom:Int ;\n\t\t\trdf:value (\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t)\n\t\t] ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#predelay> \"0\"^^xsd:int ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#artificial_latency> \"0\"^^xsd:int ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#channel_gain> [\n\t\t\ta atom:Vector ;\n\t\t\tatom:childType atom:Float ;\n\t\t\trdf:value (\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t)\n\t\t] ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#gain> \"1.0\"^^xsd:float ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#sum_inputs> false ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#ir> <file:///home/fernando/The%20John%20Petrucci%20IR%20Collection%20-%20Vol.%201/03.%20DreamWorld%20Pack/48k%2016bit%20wav/Blends/DrmWrld-LD%20blend+rm%20mesa%204x12%20recto.wav>\n\t] .\n",
+      "uri": "http://gareus.org/oss/lv2/zeroconvolv#CfgMono"
+    }
+  ],
+  "name": "Rhythm"
+}

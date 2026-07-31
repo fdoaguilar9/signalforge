@@ -1,0 +1,42 @@
+// Test fixture for --preset-roundtrip (SF-12). Hand-written on purpose:
+// it exercises the documented schema (PLAN.md §5.1) rather than only the
+// shape our own serializer happens to emit.
+//
+// Comments are here deliberately too -- the plan documents presets as
+// jsonc-style, so the loader has to tolerate them. They are not data, so
+// they are not expected to survive a round-trip.
+{
+  "name": "Crunch Rhythm",
+  "chain": [
+    {
+      "uri": "http://github.com/mikeoliphant/neural-amp-modeler-lv2",
+      "bypassed": false,
+      "controls": {
+        "input_level": 0.0,
+        "output_level": -3.0,
+        "quality_scale": 1.0
+      },
+      "state": "@prefix state: <http://lv2plug.in/ns/ext/state#> .\n<> state:state [ <http://github.com/mikeoliphant/neural-amp-modeler-lv2#model> <file:///tmp/model_a.nam> ] .\n"
+    },
+    {
+      "uri": "http://kxstudio.sf.net/carla/plugins/audiogain",
+      "controls": {
+        // Not exactly representable as a float -- deliberately included so
+        // the round-trip check has to be honest about float precision.
+        "gain": 0.1
+      }
+    },
+    {
+      "uri": "http://gareus.org/oss/lv2/zeroconvolv#Mono",
+      "bypassed": true,
+      "controls": {}
+    }
+  ],
+  "midi": {
+    "trigger": {
+      "type": "program_change",
+      "channel": 0,
+      "number": 3
+    }
+  }
+}

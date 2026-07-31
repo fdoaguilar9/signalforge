@@ -1,0 +1,60 @@
+[
+  {
+    "action": "load_preset",
+    "number": 0,
+    "preset": "01-clean",
+    "type": "program_change"
+  },
+  {
+    "action": "load_preset",
+    "number": 1,
+    "preset": "02-rhythm",
+    "type": "program_change"
+  },
+  {
+    "action": "load_preset",
+    "number": 2,
+    "preset": "03-lead",
+    "type": "program_change"
+  },
+  {
+    "action": "next_preset",
+    "number": 80,
+    "type": "cc"
+  },
+  {
+    "action": "prev_preset",
+    "number": 81,
+    "type": "cc"
+  },
+  {
+    "action": "set_control",
+    "max": 20.0,
+    "min": -20.0,
+    "number": 11,
+    "port": "input_level",
+    "stage": 0,
+    "type": "cc"
+  },
+  {
+    "action": "load_preset",
+    "channel": 0,
+    "number": 20,
+    "preset": "01-clean",
+    "type": "cc"
+  },
+  {
+    "action": "load_preset",
+    "channel": 0,
+    "number": 22,
+    "preset": "02-rhythm",
+    "type": "cc"
+  },
+  {
+    "action": "load_preset",
+    "channel": 0,
+    "number": 24,
+    "preset": "03-lead",
+    "type": "cc"
+  }
+]

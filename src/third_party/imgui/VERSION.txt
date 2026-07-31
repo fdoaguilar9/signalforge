@@ -1,0 +1,10 @@
+Dear ImGui v1.92.9
+commit 01380c579715e62fb9a8d6ec0502c4ea83bfde6e
+https://github.com/ocornut/imgui
+
+Vendored rather than a submodule: this is a pedalboard, and building one
+should not need network access. Only what we use is here -- the core,
+plus the SDL2 platform backend and the SDL_Renderer2 rendering backend.
+The demo, docs, examples, and the other dozen backends are not.
+
+To update: copy the same file list from a new tag and re-run the tests.

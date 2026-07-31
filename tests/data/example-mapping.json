@@ -1,0 +1,21 @@
+// A hand-written mapping table, in the shape a real foot controller would
+// want. Doubles as the fixture for the `midi_map_file` test.
+[
+	// Bank of program changes, one per preset.
+	{ "type": "program_change", "channel": 0, "number": 0, "action": "load_preset", "preset": "clean" },
+	{ "type": "program_change", "channel": 0, "number": 1, "action": "load_preset", "preset": "crunch" },
+	{ "type": "program_change", "channel": 0, "number": 2, "action": "load_preset", "preset": "lead" },
+
+	// Two momentary footswitches for stepping through the library. No
+	// "channel" key, so these listen on all 16 -- handy when you don't know
+	// what the pedal is set to.
+	{ "type": "cc", "number": 80, "action": "next_preset" },
+	{ "type": "cc", "number": 81, "action": "prev_preset" },
+
+	// Stomp the boost (chain stage 1) in and out.
+	{ "type": "cc", "channel": 0, "number": 82, "action": "toggle_bypass", "stage": 1 },
+
+	// Expression pedal on the amp's gain, scaled into the port's range.
+	{ "type": "cc", "channel": 0, "number": 11, "action": "set_control", "stage": 0, "port": "input",
+	  "min": -20.0, "max": 20.0 }
+]
