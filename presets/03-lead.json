@@ -3,8 +3,8 @@
     {
       "bypassed": false,
       "controls": {
-        "input_level": 0.0,
-        "output_level": -6.0,
+        "input_level": 0.6209999918937683,
+        "output_level": -1.3880000114440918,
         "quality_scale": 1.0
       },
       "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://github.com/mikeoliphant/neural-amp-modeler-lv2> ;\n\tstate:state [\n\t\t<http://github.com/mikeoliphant/neural-amp-modeler-lv2#model> <file:///home/fernando/Downloads/Mesa%20Boogie%20JP-2C%20Pack!/JP2C%20Capture%2019%20Petrucci%20Lead%20Current%20settings%20-%20Emil%20Rohbe.nam>\n\t] .\n",
@@ -22,7 +22,7 @@
       "uri": "http://gareus.org/oss/lv2/zeroconvolv#CfgMono"
     },
     {
-      "bypassed": false,
+      "bypassed": true,
       "controls": {
         "div": 4.0,
         "dot": 0.0,

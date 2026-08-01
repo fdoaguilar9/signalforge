@@ -1,5 +1,5 @@
-add_executable(signalforge main.cpp app/Settings.cpp audio/Crossfade.cpp lv2/PortInfo.cpp lv2/PathProperty.cpp lv2/UridMap.cpp lv2/Worker.cpp lv2/PluginStage.cpp lv2/Chain.cpp
-	jack/JackEngine.cpp midi/MidiEvent.cpp midi/MidiMap.cpp midi/MidiLearn.cpp offline/OfflineEngine.cpp preset/Preset.cpp
+add_executable(signalforge main.cpp app/Settings.cpp audio/Crossfade.cpp audio/AudioConfig.cpp lv2/PortInfo.cpp lv2/PathProperty.cpp lv2/UridMap.cpp lv2/Worker.cpp lv2/PluginStage.cpp lv2/Chain.cpp
+	jack/JackEngine.cpp jack/JackServer.cpp midi/MidiEvent.cpp midi/MidiMap.cpp midi/MidiLearn.cpp offline/OfflineEngine.cpp preset/Preset.cpp
 	preset/ChainPreset.cpp
 	preset/PresetLibrary.cpp)
 
@@ -28,7 +28,7 @@ if(SDL2_FOUND)
 	# Vendored third-party code, held to its own standards rather than ours.
 	target_compile_options(imgui PRIVATE -w)
 
-	target_sources(signalforge PRIVATE ui/AppWindow.cpp ui/BoardView.cpp ui/UiSelfTest.cpp)
+	target_sources(signalforge PRIVATE ui/AppWindow.cpp ui/BoardView.cpp ui/AudioSettingsView.cpp ui/UiSelfTest.cpp)
 	target_link_libraries(signalforge PRIVATE imgui)
 	target_compile_definitions(signalforge PRIVATE SIGNALFORGE_GUI)
 endif()

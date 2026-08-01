@@ -33,12 +33,16 @@ bool JackEngine::Open(const std::string& client_name)
 
 double JackEngine::SampleRate() const
 {
-	return static_cast<double>(jack_get_sample_rate(client_));
+	// A closed engine (SF-38: between tearing the old one down and a new one
+	// coming up during a live audio-settings restart) has no client to ask.
+	// Zero rather than a crash -- the same "never the reason a board won't
+	// play" posture as Settings.
+	return client_ ? static_cast<double>(jack_get_sample_rate(client_)) : 0.0;
 }
 
 uint32_t JackEngine::MaxBlockSize() const
 {
-	return jack_get_buffer_size(client_);
+	return client_ ? jack_get_buffer_size(client_) : 0;
 }
 
 namespace
@@ -66,6 +70,47 @@ bool ContainsNoCase(const std::string& haystack, const std::string& needle)
 bool IsLoopbackPort(const std::string& port_name)
 {
 	return ContainsNoCase(port_name, "midi through") || ContainsNoCase(port_name, "midi_through");
+}
+
+// Raises `target` to `value` if `value` is larger, and leaves it alone
+// otherwise. Called on the audio thread: the loop is uncontended in practice
+// (one writer, and a reader that only ever swaps in zero) and never blocks,
+// which a mutex around a meter would.
+void RaisePeak(std::atomic<float>& target, float value)
+{
+	float previous = target.load(std::memory_order_relaxed);
+
+	while (value > previous && !target.compare_exchange_weak(previous, value, std::memory_order_relaxed))
+	{
+		// compare_exchange_weak refreshed `previous`; retry unless it has
+		// meanwhile risen above what we were going to store.
+	}
+}
+
+// Largest magnitude in a block, and whether anything in it reached full
+// scale. Full scale is the clip test rather than "> 1.0" because a sample
+// sitting exactly at 1.0 is already the top of the range: by the time it is
+// past it, the converter has been square-waving for a while.
+float BlockPeak(const float* samples, jack_nframes_t frames, bool& clipped)
+{
+	float peak = 0.0f;
+
+	for (jack_nframes_t i = 0; i < frames; ++i)
+	{
+		const float magnitude = std::fabs(samples[i]);
+
+		if (magnitude > peak)
+		{
+			peak = magnitude;
+		}
+	}
+
+	if (peak >= 1.0f)
+	{
+		clipped = true;
+	}
+
+	return peak;
 }
 
 // Counts a host's boundary audio ports, so a swap can check the new host
@@ -139,6 +184,10 @@ bool JackEngine::Start(AudioHost* host)
 	}
 
 	jack_set_process_callback(client_, &JackEngine::ProcessCallback, this);
+
+	// So a live buffer-size change (SetBufferSize) resizes the crossfade
+	// scratch instead of overflowing it on the next fade.
+	jack_set_buffer_size_callback(client_, &JackEngine::BufferSizeCallback, this);
 
 	if (jack_activate(client_) != 0)
 	{
@@ -257,6 +306,210 @@ std::vector<std::string> JackEngine::ConnectMidiInputs(const std::string& device
 	}
 
 	return connected;
+}
+
+std::vector<std::string> JackEngine::ConnectAudioPorts(const std::string& input_filter,
+	const std::string& output_filter)
+{
+	std::vector<std::string> connected;
+
+	const auto find_physical = [this](unsigned long jack_direction_flag, const std::string& filter)
+	{
+		std::vector<std::string> found;
+
+		const char** ports = jack_get_ports(client_, nullptr, JACK_DEFAULT_AUDIO_TYPE, jack_direction_flag);
+
+		if (!ports)
+		{
+			return found;
+		}
+
+		for (size_t i = 0; ports[i]; ++i)
+		{
+			const std::string name = ports[i];
+
+			if (!filter.empty())
+			{
+				if (ContainsNoCase(name, filter))
+				{
+					found.push_back(name);
+				}
+
+				continue;
+			}
+
+			jack_port_t* port = jack_port_by_name(client_, name.c_str());
+
+			if (port && (jack_port_flags(port) & JackPortIsPhysical) != 0)
+			{
+				found.push_back(name);
+			}
+		}
+
+		jack_free(ports);
+		std::sort(found.begin(), found.end());
+
+		return found;
+	};
+
+	// Hardware capture ports are JACK *outputs* (data flows out of the
+	// interface into the graph); they feed our in_N ports.
+	const std::vector<std::string> capture_ports = find_physical(JackPortIsOutput, input_filter);
+
+	for (size_t i = 0; i < inputs_.size() && i < capture_ports.size(); ++i)
+	{
+		const char* our_name = jack_port_name(inputs_[i].jack_port);
+		const int result = jack_connect(client_, capture_ports[i].c_str(), our_name);
+
+		if (result == 0 || result == EEXIST)
+		{
+			connected.push_back(capture_ports[i] + " -> " + our_name);
+		}
+		else
+		{
+			std::fprintf(stderr, "Warning: could not connect audio input '%s' (error %d).\n",
+				capture_ports[i].c_str(), result);
+		}
+	}
+
+	// Hardware playback ports are JACK *inputs*; our out_N ports (including
+	// the mono->stereo mirror) feed them.
+	const std::vector<std::string> playback_ports = find_physical(JackPortIsInput, output_filter);
+
+	std::vector<jack_port_t*> our_outputs;
+
+	for (const AudioPortBinding& binding : outputs_)
+	{
+		our_outputs.push_back(binding.jack_port);
+	}
+
+	for (const MirrorBinding& mirror : mirrors_)
+	{
+		our_outputs.push_back(mirror.jack_port);
+	}
+
+	for (size_t i = 0; i < our_outputs.size() && i < playback_ports.size(); ++i)
+	{
+		const char* our_name = jack_port_name(our_outputs[i]);
+		const int result = jack_connect(client_, our_name, playback_ports[i].c_str());
+
+		if (result == 0 || result == EEXIST)
+		{
+			connected.push_back(std::string(our_name) + " -> " + playback_ports[i]);
+		}
+		else
+		{
+			std::fprintf(stderr, "Warning: could not connect audio output '%s' (error %d).\n", our_name, result);
+		}
+	}
+
+	for (const std::string& pair : connected)
+	{
+		std::printf("Audio connected: %s\n", pair.c_str());
+	}
+
+	if (connected.empty())
+	{
+		std::fprintf(stderr, "Warning: no physical audio ports matched; connect them manually if you need them.\n");
+	}
+
+	return connected;
+}
+
+int JackEngine::BufferSizeCallback(jack_nframes_t nframes, void* arg)
+{
+	static_cast<JackEngine*>(arg)->ResizeScratch(nframes);
+
+	return 0;
+}
+
+void JackEngine::ResizeScratch(uint32_t frames)
+{
+	// JACK guarantees processing is stopped around this callback, which is
+	// the only reason allocating here is allowed at all.
+	for (std::vector<float>& buffer : outgoing_scratch_)
+	{
+		buffer.assign(frames, 0.0f);
+	}
+
+	for (std::vector<float>& buffer : incoming_scratch_)
+	{
+		buffer.assign(frames, 0.0f);
+	}
+}
+
+bool JackEngine::SetBufferSize(uint32_t frames)
+{
+	if (!client_)
+	{
+		return false;
+	}
+
+	return jack_set_buffer_size(client_, frames) == 0;
+}
+
+double JackEngine::RoundTripLatencyMs() const
+{
+	const double rate = SampleRate();
+
+	if (!client_ || rate <= 0.0)
+	{
+		return 0.0;
+	}
+
+	jack_nframes_t total = 0;
+
+	// What JACK reports already accounts for the hardware's own buffering
+	// and for anything patched in front of or behind us, which is why this
+	// is asked rather than computed from the period.
+	if (!inputs_.empty())
+	{
+		jack_latency_range_t range{};
+		jack_port_get_latency_range(inputs_[0].jack_port, JackCaptureLatency, &range);
+		total += range.max;
+	}
+
+	if (!outputs_.empty())
+	{
+		jack_latency_range_t range{};
+		jack_port_get_latency_range(outputs_[0].jack_port, JackPlaybackLatency, &range);
+		total += range.max;
+	}
+
+	// Unconnected ports report zero, which would read as "no latency at all".
+	// One period is the floor a client cannot beat, so say that instead.
+	if (total == 0)
+	{
+		total = jack_get_buffer_size(client_);
+	}
+
+	return 1000.0 * static_cast<double>(total) / rate;
+}
+
+void JackEngine::DisconnectAudioPorts()
+{
+	if (!client_)
+	{
+		return;
+	}
+
+	// jack_port_disconnect drops *all* connections on the given port, which
+	// is exactly the intent here: whatever this port was patched to, it
+	// isn't any more, and ConnectAudioPorts decides what it should be now.
+	for (const AudioPortBinding& binding : inputs_)
+	{
+		jack_port_disconnect(client_, binding.jack_port);
+	}
+
+	for (const AudioPortBinding& binding : outputs_)
+	{
+		jack_port_disconnect(client_, binding.jack_port);
+	}
+
+	for (const MirrorBinding& mirror : mirrors_)
+	{
+		jack_port_disconnect(client_, mirror.jack_port);
+	}
 }
 
 void JackEngine::SetCrossfade(double milliseconds, CrossfadeCurve curve)
@@ -468,6 +721,8 @@ int JackEngine::Process(jack_nframes_t nframes)
 
 	// Both hosts read the same input buffers; they only read, so sharing is
 	// fine.
+	float input_peak = 0.0f;
+
 	for (const AudioPortBinding& binding : inputs_)
 	{
 		float* buffer = static_cast<float*>(jack_port_get_buffer(binding.jack_port, nframes));
@@ -477,7 +732,15 @@ int JackEngine::Process(jack_nframes_t nframes)
 		{
 			incoming->ConnectAudioPort(binding.plugin_port_index, buffer);
 		}
+
+		// Measured before the chain runs, so this is what arrived from the
+		// interface -- the number that says whether the *guitar* is too hot,
+		// independently of what the plugins then do with it.
+		bool ignored = false;
+		input_peak = std::max(input_peak, BlockPeak(buffer, nframes, ignored));
 	}
+
+	RaisePeak(input_peak_, input_peak);
 
 	if (!incoming)
 	{
@@ -535,6 +798,25 @@ int JackEngine::Process(jack_nframes_t nframes)
 		float* dest = static_cast<float*>(jack_port_get_buffer(mirror.jack_port, nframes));
 
 		std::memcpy(dest, source, nframes * sizeof(float));
+	}
+
+	// Measured last, on the buffers actually going to the interface: after
+	// the chain, and after a crossfade mix, since a switch is exactly when
+	// two chains summing can push the output into clipping.
+	float output_peak = 0.0f;
+	bool clipped = false;
+
+	for (const AudioPortBinding& binding : outputs_)
+	{
+		const float* buffer = static_cast<const float*>(jack_port_get_buffer(binding.jack_port, nframes));
+		output_peak = std::max(output_peak, BlockPeak(buffer, nframes, clipped));
+	}
+
+	RaisePeak(output_peak_, output_peak);
+
+	if (clipped)
+	{
+		output_clips_.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	// Release-ordered so a control thread that sees this count knows the

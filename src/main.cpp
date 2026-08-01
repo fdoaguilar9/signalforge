@@ -15,14 +15,18 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 #include <jack/jack.h>
 #include <lilv/lilv.h>
 
 #include <nlohmann/json.hpp>
 
 #include "app/Settings.h"
+#include "audio/AudioConfig.h"
 #include "audio/Crossfade.h"
 #include "jack/JackEngine.h"
+#include "jack/JackServer.h"
 #include "lv2/Chain.h"
 #include "midi/MidiEvent.h"
 #include "midi/MidiLearn.h"
@@ -38,6 +42,7 @@
 
 #ifdef SIGNALFORGE_GUI
 #include "ui/AppWindow.h"
+#include "ui/AudioSettingsView.h"
 #include "ui/BoardView.h"
 #include "ui/UiSelfTest.h"
 #endif
@@ -48,11 +53,12 @@ namespace
 void PrintUsage(const char* argv0)
 {
 	std::printf(
-		"Usage: %s [--list-plugins | --inspect <plugin-uri> | --preset-roundtrip <preset.json> |\n"
+		"Usage: %s [--list-plugins | --list-audio-devices | --inspect <plugin-uri> | --preset-roundtrip <preset.json> |\n"
 		"           --list-presets [--preset-dir <dir>] |\n"
 		"           --run-preset [name|index|path] [--preset-dir <dir>] [--no-crossfade]\n"
 		"                        [--midi-device <name>] [--no-midi-connect] [--midi-map <file>] [--gui]\n"
-		"                        [--settings <file>] [--crossfade-ms <N>] [--crossfade-curve equal-power|linear] |\n"
+		"                        [--settings <file>] [--crossfade-ms <N>] [--crossfade-curve equal-power|linear]\n"
+		"                        [--reconfigure-audio] |\n"
 		"           --tune-crossfade [--sample-rate N] |\n"
 		"           --check-midi-map <mapping.json> | --test-ui [frames] |\n"
 		"           --test-add-stage <preset> <plugin-uri> [--preset-dir <dir>] |\n"
@@ -124,6 +130,51 @@ int ListPlugins()
 	std::printf("\n%u plugin(s) found.\n", count);
 
 	lilv_world_free(world);
+
+	return 0;
+}
+
+// A starting guess at the substring that will identify this device's ports
+// in the running JACK graph, e.g. "USB-Audio - Scarlett Solo USB" -> "Scarlett
+// Solo USB". Only a guess -- the actual port names are the server's (or
+// PipeWire's) to decide, which is exactly why the dialog's port filter field
+// stays editable rather than trusting this blindly.
+std::string GuessPortFilter(const std::string& device_name)
+{
+	const size_t separator = device_name.rfind(" - ");
+
+	return separator == std::string::npos ? device_name : device_name.substr(separator + 3);
+}
+
+// SF-34: what the audio config step has to choose between. No side effects --
+// doesn't start or touch a server.
+int ListAudioDevices()
+{
+	if (sf::IsJackServerRunning())
+	{
+		std::printf(
+			"A JACK server is already running -- SignalForge will connect to it as-is; device/rate/buffer are that "
+			"server's own settings, not ours to choose.\n\n");
+	}
+	else
+	{
+		std::printf("No JACK server is currently reachable -- SignalForge would start its own.\n\n");
+	}
+
+	const std::vector<sf::AudioDevice> devices = sf::EnumerateAlsaDevices();
+
+	if (devices.empty())
+	{
+		std::printf("No ALSA hardware devices found.\n");
+		return 0;
+	}
+
+	for (const sf::AudioDevice& device : devices)
+	{
+		std::printf("%-8s %s\n", device.id.c_str(), device.name.c_str());
+	}
+
+	std::printf("\n%zu device(s) found.\n", devices.size());
 
 	return 0;
 }
@@ -808,7 +859,246 @@ struct RunPresetOptions
 
 	bool crossfade_curve_set = false;
 	sf::CrossfadeCurve crossfade_curve = sf::CrossfadeCurve::EqualPower;
+
+	// SF-36: forces the config step even if a config was already saved --
+	// the CLI equivalent of the menu's "Audio Settings...".
+	bool reconfigure_audio = false;
 };
+
+// SF-36, headless half. Lists devices and asks for a choice on stdin. Never
+// blocks a non-interactive run (a script, a test, a service unit with no
+// controlling terminal): with no TTY attached, it silently accepts the
+// defaults rather than waiting on input that will never come. Returns
+// `config` filled in and `configured` set either way.
+void ResolveAudioConfigCli(sf::AudioConfig& config)
+{
+	if (!isatty(fileno(stdin)))
+	{
+		std::printf("No terminal attached; using default audio settings (ALSA default device, %.0f Hz, %u samples). "
+					"Run with --reconfigure-audio from an interactive shell, or use the GUI's Audio Settings, to "
+					"change this.\n",
+			config.sample_rate, config.buffer_size);
+
+		config.configured = true;
+		return;
+	}
+
+	const std::vector<sf::AudioDevice> devices = sf::EnumerateAlsaDevices();
+
+	std::printf("\nAudio setup (first run -- this is remembered for next time).\n\n");
+
+	if (devices.empty())
+	{
+		std::printf("No ALSA hardware devices found; using the ALSA default.\n");
+	}
+	else
+	{
+		std::printf("Available devices:\n");
+		std::printf("  0) (ALSA default)\n");
+
+		for (size_t i = 0; i < devices.size(); ++i)
+		{
+			std::printf("  %zu) %s (%s)\n", i + 1, devices[i].name.c_str(), devices[i].id.c_str());
+		}
+
+		std::printf("Device [0]: ");
+		std::fflush(stdout);
+
+		std::string line;
+
+		if (std::getline(std::cin, line) && !line.empty())
+		{
+			try
+			{
+				const long choice = std::stol(line);
+
+				if (choice >= 1 && static_cast<size_t>(choice) <= devices.size())
+				{
+					config.device = devices[static_cast<size_t>(choice - 1)].id;
+					// A starting guess for which physical ports belong to this
+					// device; more than one interface can be plugged in even
+					// when we're the one spawning jackd.
+					config.input_ports = GuessPortFilter(devices[static_cast<size_t>(choice - 1)].name);
+					config.output_ports = config.input_ports;
+				}
+			}
+			catch (const std::exception&)
+			{
+				// Not a number: keep the default rather than refuse to start.
+			}
+		}
+	}
+
+	// Asked separately, because they genuinely differ: a guitar in an
+	// interface and the sound out to headphones on the motherboard codec is
+	// the ordinary case, not an exotic one.
+	{
+		std::string line;
+
+		std::printf("Input port filter [%s]: ",
+			config.input_ports.empty() ? "(any physical port)" : config.input_ports.c_str());
+		std::fflush(stdout);
+
+		if (std::getline(std::cin, line) && !line.empty())
+		{
+			config.input_ports = line;
+		}
+
+		std::printf("Output port filter [%s]: ",
+			config.output_ports.empty() ? "(any physical port)" : config.output_ports.c_str());
+		std::fflush(stdout);
+
+		if (std::getline(std::cin, line) && !line.empty())
+		{
+			config.output_ports = line;
+		}
+	}
+
+	std::printf("Sample rate [%.0f]: ", config.sample_rate);
+	std::fflush(stdout);
+
+	std::string line;
+
+	if (std::getline(std::cin, line) && !line.empty())
+	{
+		const double rate = std::atof(line.c_str());
+
+		if (rate > 0.0)
+		{
+			config.sample_rate = rate;
+		}
+	}
+
+	std::printf("Buffer size [%u]: ", config.buffer_size);
+	std::fflush(stdout);
+
+	if (std::getline(std::cin, line) && !line.empty())
+	{
+		const long size = std::atol(line.c_str());
+
+		if (size > 0)
+		{
+			config.buffer_size = static_cast<uint32_t>(size);
+		}
+	}
+
+	config.driver = "alsa";
+	config.Clamp();
+	config.configured = true;
+}
+
+#ifdef SIGNALFORGE_GUI
+// SF-36, GUI half. Opens its own small window, draws SF-38's Audio Settings
+// dialog in it until the user starts, and closes it -- this runs *before*
+// the real board window exists (that one opens only once the engine is up),
+// so it can't just be a popup inside the usual frame loop.
+bool ResolveAudioConfigGui(sf::AudioConfig& config)
+{
+	const std::vector<sf::AudioDevice> raw_devices = sf::EnumerateAlsaDevices();
+	std::vector<sf::AudioSettingsDevice> devices;
+
+	for (const sf::AudioDevice& device : raw_devices)
+	{
+		devices.push_back({device.id, device.name + " (" + device.id + ")", GuessPortFilter(device.name)});
+	}
+
+	sf::AppWindow window;
+	std::string error;
+
+	if (!window.Open("Signalforge -- Audio Setup", 480, 320, error))
+	{
+		std::fprintf(stderr, "%s -- falling back to defaults.\n", error.c_str());
+		config.configured = true;
+		return true;
+	}
+
+	sf::AudioSettingsViewState state;
+	state.first_run = true;
+	state.devices = &devices;
+	state.sample_rate = config.sample_rate;
+	state.buffer_size = config.buffer_size;
+	state.input_filter = config.input_ports;
+	state.output_filter = config.output_ports;
+
+	for (size_t i = 0; i < devices.size(); ++i)
+	{
+		if (devices[i].id == config.device)
+		{
+			state.selected_device = static_cast<int>(i);
+		}
+	}
+
+	bool done = false;
+
+	while (!done)
+	{
+		if (!window.BeginFrame())
+		{
+			// The user closed the window instead of choosing: proceed with
+			// whatever defaults are already in `config` rather than refuse to
+			// start at all.
+			config.configured = true;
+			window.Close();
+			return true;
+		}
+
+		state.apply_requested = false;
+		DrawAudioSettings(state);
+		window.EndFrame();
+
+		if (state.apply_requested)
+		{
+			config.device = state.selected_device >= 0 ? devices[static_cast<size_t>(state.selected_device)].id
+														 : std::string();
+			config.sample_rate = state.sample_rate;
+			config.buffer_size = state.buffer_size;
+			config.input_ports = state.input_filter;
+			config.output_ports = state.output_filter;
+			config.driver = "alsa";
+			config.Clamp();
+			config.configured = true;
+			done = true;
+		}
+	}
+
+	window.Close();
+
+	return true;
+}
+#endif
+
+// SF-36: the audio backend must be chosen before anything opens it. A config
+// already on file wins outright. Otherwise, a JACK server already running is
+// adopted with no question asked -- there's nothing left to configure -- and
+// only a genuinely unconfigured, serverless machine reaches the interactive
+// step (CLI prompt, or a small standalone window under --gui).
+void ResolveAudioConfig(sf::Settings& settings, bool show_gui)
+{
+	if (settings.audio.configured)
+	{
+		return;
+	}
+
+	if (sf::IsJackServerRunning())
+	{
+		settings.audio.driver = "external";
+		settings.audio.configured = true;
+		std::printf("A JACK server is already running; connecting to it as-is.\n");
+		return;
+	}
+
+#ifdef SIGNALFORGE_GUI
+	if (show_gui)
+	{
+		ResolveAudioConfigGui(settings.audio);
+		return;
+	}
+#else
+	(void)show_gui;
+#endif
+
+	ResolveAudioConfigCli(settings.audio);
+}
 
 int RunPreset(const std::string& query, const std::string& preset_dir, const RunPresetOptions& options)
 {
@@ -846,6 +1136,11 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	if (options.crossfade_curve_set)
 	{
 		settings.crossfade_curve = options.crossfade_curve;
+	}
+
+	if (options.reconfigure_audio)
+	{
+		settings.audio.configured = false;
 	}
 
 	settings.Clamp();
@@ -933,6 +1228,21 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		}
 	}
 
+	// SF-36. Blocks (interactively, if there's anyone to ask) until the audio
+	// backend is chosen -- before the world/engine below touch any of it.
+	ResolveAudioConfig(settings, options.show_gui);
+
+	// SF-35. A no-op if a server was already found running (settings.audio
+	// then says "external" and there is nothing for us to start).
+	sf::JackServer jack_server;
+	std::string jack_server_error;
+
+	if (!jack_server.EnsureRunning(settings.audio, jack_server_error))
+	{
+		std::fprintf(stderr, "%s\n", jack_server_error.c_str());
+		return 1;
+	}
+
 	LilvWorld* world = lilv_world_new();
 	lilv_world_load_all(world);
 
@@ -940,6 +1250,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 
 	if (!engine.Open("signalforge"))
 	{
+		jack_server.Stop();
 		lilv_world_free(world);
 		return 1;
 	}
@@ -967,6 +1278,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	{
 		std::fprintf(stderr, "%s\n", error.c_str());
 		engine.Close();
+		jack_server.Stop();
 		lilv_world_free(world);
 		return 1;
 	}
@@ -974,9 +1286,13 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	if (!engine.Start(chain.get()))
 	{
 		engine.Close();
+		jack_server.Stop();
 		lilv_world_free(world);
 		return 1;
 	}
+
+	// SF-39, after Start(): that's where in_N/out_N are actually registered.
+	engine.ConnectAudioPorts(settings.audio.input_ports, settings.audio.output_ports);
 
 	if (options.connect_midi)
 	{
@@ -1294,6 +1610,14 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	bool unsaved_changes = false;
 	std::string ui_status;
 
+	// Meter state that has to survive between frames: the decaying displayed
+	// level, and how long a clip warning stays up. See the ballistics note at
+	// the point of use.
+	float meter_input = 0.0f;
+	float meter_output = 0.0f;
+	uint64_t last_clip_count = 0;
+	std::chrono::steady_clock::time_point clip_warning_until;
+
 	sf::BoardViewUi view_ui;
 
 	// What the picker is showing, and where that listing came from.
@@ -1456,6 +1780,124 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 			current_index >= count ? (delta > 0 ? 0 : count - 1) : (current_index + count + delta) % count;
 
 		return switch_to_preset(library.At(next_index).preset, library.At(next_index).path, next_index);
+	};
+
+	// SF-38: applies a changed audio config from the Audio Settings dialog
+	// while the board is running. Unlike switch_to_preset, this can't be a
+	// crossfade -- changing device/rate/buffer means restarting the JACK
+	// server itself when we're the one managing it, and that takes every
+	// client on it, ours included, down with it. So there is a real gap
+	// here, audible and unavoidable, the same one a physical interface swap
+	// would cause; what this guards against is a *failed* change leaving
+	// the board silent afterward. It tries the requested config first and,
+	// if that doesn't come up clean, falls back to reopening the config that
+	// was working before, so "the new setting didn't work" doesn't compound
+	// into "and now nothing plays". Returns empty on success, or a message
+	// describing what happened otherwise.
+	auto restart_audio_engine = [&](const sf::AudioConfig& requested_config) -> std::string
+	{
+		const sf::AudioConfig previous_config = settings.audio;
+
+		// The rate `chain` is currently built for. Tracked as its own
+		// variable rather than re-read from `engine` each time: if the
+		// forward attempt gets far enough to rebuild the chain and only then
+		// fails at Start(), the fallback attempt has to know the chain now
+		// belongs to the *new* rate, not the rate the board started this
+		// call at.
+		double chain_sample_rate = engine.SampleRate();
+
+		auto bring_up = [&](const sf::AudioConfig& config, std::string& reason) -> bool
+		{
+			if (!jack_server.EnsureRunning(config, reason))
+			{
+				return false;
+			}
+
+			if (!engine.Open("signalforge"))
+			{
+				reason = "could not open a JACK client";
+				jack_server.Stop();
+				return false;
+			}
+
+			engine.SetCrossfade(settings.crossfade_ms, settings.crossfade_curve);
+
+			// A plugin instance is instantiated at a fixed sample rate; if the
+			// new server runs at a different one, the running chain is no
+			// longer valid and has to be rebuilt rather than just re-hosted.
+			if (std::fabs(engine.SampleRate() - chain_sample_rate) > 0.5)
+			{
+				sf::ChainBuildReport report;
+				std::unique_ptr<sf::Chain> rebuilt = sf::BuildChainFromPreset(
+					world, current_source, engine.SampleRate(), engine.MaxBlockSize(), urid_map, reason, &report);
+
+				if (!rebuilt)
+				{
+					engine.Close();
+					jack_server.Stop();
+					return false;
+				}
+
+				chain = std::move(rebuilt);
+				chain_sample_rate = engine.SampleRate();
+				missing_plugins = report.skipped_uris;
+#ifdef SIGNALFORGE_GUI
+				stage_statics_valid = false;
+#endif
+			}
+
+			if (!engine.Start(chain.get()))
+			{
+				reason = "could not start the audio engine with the new settings";
+				engine.Close();
+				jack_server.Stop();
+				return false;
+			}
+
+			engine.ConnectAudioPorts(config.input_ports, config.output_ports);
+
+			if (options.connect_midi)
+			{
+				engine.ConnectMidiInputs(options.midi_device);
+			}
+
+			settings.audio = config;
+
+			// EnsureRunning short-circuits to "do nothing" when a server is
+			// already reachable, whether or not `config` asked for "alsa" --
+			// jack_server.OwnsServer() is the actual truth of who's running
+			// it. Recording the requested driver verbatim here would relabel
+			// an already-running external server as one we manage, and the
+			// next time the dialog opens it would wrongly claim nothing is
+			// running and offer to start a server that's already up.
+			settings.audio.driver = jack_server.OwnsServer() ? "alsa" : "external";
+
+			return true;
+		};
+
+		// The old engine has to come down before a differently-configured
+		// server can come up -- there is no way to run both a device's old
+		// and new configuration at once.
+		engine.Close();
+		jack_server.Stop();
+
+		std::string failure;
+
+		if (bring_up(requested_config, failure))
+		{
+			save_settings();
+			return std::string();
+		}
+
+		std::string recovery_failure;
+
+		if (bring_up(previous_config, recovery_failure))
+		{
+			return "Could not apply the new audio settings (" + failure + "); reverted to the previous ones.";
+		}
+
+		return "Could not apply the new audio settings (" + failure + "), and reverting also failed (" +
+			recovery_failure + "). Audio is stopped -- try Audio Settings again.";
 	};
 
 	sf::MidiLearn midi_learn;
@@ -1698,11 +2140,33 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		{
 			std::fprintf(stderr, "%s\n", ui_error.c_str());
 			engine.Close();
+			jack_server.Stop();
 			chain.reset();
 			lilv_world_free(world);
 			return 1;
 		}
 	}
+
+	// SF-37/38: opened from the menu bar, closed by Apply or Cancel. State
+	// persists across frames the same way view_ui does -- it's what the user
+	// is in the middle of typing/choosing, not something rebuilt each draw.
+	bool audio_settings_open = false;
+	sf::AudioSettingsViewState audio_settings_view;
+	std::vector<sf::AudioSettingsDevice> audio_settings_devices;
+
+	for (const sf::AudioDevice& device : sf::EnumerateAlsaDevices())
+	{
+		audio_settings_devices.push_back({device.id, device.name + " (" + device.id + ")", GuessPortFilter(device.name)});
+	}
+
+	audio_settings_view.devices = &audio_settings_devices;
+
+	// Refreshed each time the dialog is opened (below), not per frame: the
+	// live JACK port list is the reason to prefer this over the ALSA-based
+	// guess above, but asking the server for it is not free enough to do at
+	// 60Hz for a window that spends almost all its time closed.
+	std::vector<sf::AudioSettingsJackPort> audio_settings_jack_ports;
+	audio_settings_view.jack_ports = &audio_settings_jack_ports;
 #endif
 
 	// Commands arrive on their own thread so audio keeps running while a
@@ -1979,7 +2443,41 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 			view.preset_path = current_path;
 			view.sample_rate = engine.SampleRate();
 			view.block_size = engine.MaxBlockSize();
-			view.audio_cycles = engine.ProcessCycleCount();
+			view.latency_ms = engine.RoundTripLatencyMs();
+
+			// Meter ballistics. The peaks come back as "loudest since you
+			// last looked" and are reset by the read, so a bar driven
+			// straight from them flickers: a transient shows for one frame
+			// and vanishes. Rising instantly and falling slowly is what a
+			// real meter does, and it's what makes a peak readable at all.
+			{
+				const float input_peak = engine.TakeInputPeak();
+				const float output_peak = engine.TakeOutputPeak();
+
+				constexpr float kFallPerFrame = 0.94f;
+
+				meter_input = std::max(input_peak, meter_input * kFallPerFrame);
+				meter_output = std::max(output_peak, meter_output * kFallPerFrame);
+
+				const auto to_db = [](float magnitude)
+				{ return magnitude > 0.0f ? 20.0f * std::log10(magnitude) : -INFINITY; };
+
+				view.input_db = to_db(meter_input);
+				view.output_db = to_db(meter_output);
+
+				// Held for a moment: clipping is often a single transient,
+				// and a warning that vanishes in 16ms is one nobody sees.
+				const uint64_t clips = engine.OutputClipCount();
+
+				if (clips != last_clip_count)
+				{
+					last_clip_count = clips;
+					clip_warning_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+				}
+
+				view.output_clipping = std::chrono::steady_clock::now() < clip_warning_until;
+			}
+
 			view.midi_drops = reported_midi_drops;
 			view.midi_bindings = midi_map.Size();
 			view.presets = &board_presets;
@@ -2014,9 +2512,181 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 
 			sf::DrawBoard(view, view_ui);
 
+			if (view.audio_settings_requested)
+			{
+				audio_settings_open = true;
+				audio_settings_view.status.clear();
+				// Whether *a* server is reachable right now is the only thing
+				// that matters here -- not what `settings.audio.driver` says,
+				// which can legitimately be "alsa" even while connected to a
+				// server we don't own (e.g. right after this same dialog
+				// applied a config that a pre-existing server absorbed).
+				audio_settings_view.server_running = sf::IsJackServerRunning();
+				audio_settings_view.first_run = false;
+
+				// Live, not guessed: real port names from whatever server is
+				// actually reachable right now (almost always true here,
+				// since the board is already running against one).
+				audio_settings_jack_ports.clear();
+
+				for (const sf::PhysicalPort& port : sf::EnumeratePhysicalPorts())
+				{
+					audio_settings_jack_ports.push_back({port.name, port.client, port.port, port.is_capture});
+				}
+
+				audio_settings_view.sample_rate = settings.audio.sample_rate;
+				audio_settings_view.buffer_size = settings.audio.buffer_size;
+				audio_settings_view.input_filter = settings.audio.input_ports;
+				audio_settings_view.output_filter = settings.audio.output_ports;
+				audio_settings_view.selected_device = -1;
+
+				for (size_t i = 0; i < audio_settings_devices.size(); ++i)
+				{
+					if (audio_settings_devices[i].id == settings.audio.device)
+					{
+						audio_settings_view.selected_device = static_cast<int>(i);
+					}
+				}
+			}
+
+			audio_settings_view.apply_requested = false;
+			audio_settings_view.cancel_requested = false;
+
+			if (audio_settings_open)
+			{
+				sf::DrawAudioSettings(audio_settings_view);
+			}
+
 			// Presenting the frame waits for the display, which is what paces
 			// this loop -- so no sleep on the UI path.
 			window.EndFrame();
+
+			if (audio_settings_open && audio_settings_view.cancel_requested)
+			{
+				audio_settings_open = false;
+			}
+
+			if (audio_settings_open && audio_settings_view.apply_requested)
+			{
+				sf::AudioConfig requested = settings.audio;
+				requested.driver = "alsa";
+				requested.device = audio_settings_view.selected_device >= 0
+					? audio_settings_devices[static_cast<size_t>(audio_settings_view.selected_device)].id
+					: std::string();
+				requested.sample_rate = audio_settings_view.sample_rate;
+				requested.buffer_size = audio_settings_view.buffer_size;
+				requested.input_ports = audio_settings_view.input_filter;
+				requested.output_ports = audio_settings_view.output_filter;
+				requested.configured = true;
+
+				const bool same_device = requested.device == settings.audio.device;
+				const bool same_rate = std::fabs(requested.sample_rate - settings.audio.sample_rate) < 0.5;
+				const bool same_buffer = requested.buffer_size == settings.audio.buffer_size;
+
+				// Re-pointing the board at different hardware is a change of
+				// *patching*, not of the engine or the server -- so when
+				// that's all that changed, just re-patch. This is the common
+				// case (pick a different input device), and paying for a full
+				// engine restart, a silent gap and a chain rebuild to do it
+				// would be absurd. Anything touching the server's own
+				// settings still needs the restart below.
+				const bool ports_only = same_device && same_rate && same_buffer;
+
+				// A buffer-size change on a server we don't own doesn't need
+				// a restart either: JACK can change its period live, and
+				// restarting someone else's server (or spawning our own
+				// alongside it) to do what it already supports would be
+				// wrong. Rate still can't change this way -- the driver is
+				// opened at a rate and keeps it.
+				const bool live_buffer_change =
+					!ports_only && same_device && same_rate && !same_buffer && !jack_server.OwnsServer();
+
+				if (live_buffer_change)
+				{
+					// **Order matters and is the whole risk here.** The new
+					// period takes effect on the audio thread the moment the
+					// server agrees, while the chain that is currently
+					// running is still the one processing it -- and an LV2
+					// plugin handed more frames than it was instantiated for
+					// writes past its buffers. So a chain that can take
+					// *either* size is built and swapped in first, and only
+					// then is the size actually changed.
+					const uint32_t safe_block = std::max(requested.buffer_size, engine.MaxBlockSize());
+
+					std::string rebuild_error;
+					sf::ChainBuildReport report;
+
+					std::unique_ptr<sf::Chain> resized = sf::BuildChainFromPreset(
+						world, current_source, engine.SampleRate(), safe_block, urid_map, rebuild_error, &report);
+
+					if (!resized)
+					{
+						audio_settings_view.status = "Could not rebuild the chain for that buffer size: " +
+							rebuild_error;
+					}
+					else if (!engine.SwitchHost(resized.get()))
+					{
+						audio_settings_view.status = "Could not swap in a chain for that buffer size.";
+					}
+					else
+					{
+						engine.WaitForProcessCycles(2);
+						chain = std::move(resized);
+						missing_plugins = report.skipped_uris;
+						stage_statics_valid = false;
+
+						if (engine.SetBufferSize(requested.buffer_size))
+						{
+							settings.audio.buffer_size = requested.buffer_size;
+							settings.audio.input_ports = requested.input_ports;
+							settings.audio.output_ports = requested.output_ports;
+							settings.audio.configured = true;
+							save_settings();
+
+							audio_settings_open = false;
+							ui_status = "Buffer size is now " + std::to_string(requested.buffer_size) + " samples.";
+						}
+						else
+						{
+							// The chain is oversized for the unchanged period,
+							// which is harmless -- a maximum block is a
+							// maximum, not a promise to fill it.
+							audio_settings_view.status =
+								"The JACK server refused that buffer size; the previous one is still in use.";
+						}
+					}
+				}
+				else if (ports_only)
+				{
+					engine.DisconnectAudioPorts();
+					const std::vector<std::string> connected =
+						engine.ConnectAudioPorts(requested.input_ports, requested.output_ports);
+
+					settings.audio.input_ports = requested.input_ports;
+					settings.audio.output_ports = requested.output_ports;
+					settings.audio.configured = true;
+					save_settings();
+
+					audio_settings_open = false;
+					ui_status = connected.empty()
+						? "Audio devices applied, but nothing matched -- check the port filters."
+						: "Audio devices applied (" + std::to_string(connected.size()) + " connection(s)).";
+				}
+				else
+				{
+					const std::string restart_error = restart_audio_engine(requested);
+
+					if (restart_error.empty())
+					{
+						audio_settings_open = false;
+						ui_status = "Audio settings applied.";
+					}
+					else
+					{
+						audio_settings_view.status = restart_error;
+					}
+				}
+			}
 
 			// After presenting, not before: the switch builds a chain and can
 			// take longer than a frame, and doing it here means the click is
@@ -2218,6 +2888,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 #endif
 
 	engine.Close();
+	jack_server.Stop();
 	chain.reset();
 	lilv_world_free(world);
 
@@ -2856,6 +3527,11 @@ int main(int argc, char** argv)
 		return ListPlugins();
 	}
 
+	if (argc == 2 && std::strcmp(argv[1], "--list-audio-devices") == 0)
+	{
+		return ListAudioDevices();
+	}
+
 	if (argc == 3 && std::strcmp(argv[1], "--inspect") == 0)
 	{
 		return Inspect(argv[2]);
@@ -3020,6 +3696,10 @@ int main(int argc, char** argv)
 
 				options.crossfade_curve_set = true;
 				++i;
+			}
+			else if (std::strcmp(argv[i], "--reconfigure-audio") == 0)
+			{
+				options.reconfigure_audio = true;
 			}
 			else if (std::strcmp(argv[i], "--gui") == 0)
 			{

@@ -15,6 +15,56 @@ namespace
 // sections off the bottom of a small screen.
 constexpr float kPresetListHeight = 160.0f;
 
+// One level meter: a bar that runs from silence to full scale, coloured by
+// how close it is, with the figure alongside.
+//
+// Colour rather than only a number because the number is unreadable at a
+// glance while playing -- the point of a meter is to be understood in the
+// corner of the eye, mid-song, without reading anything.
+void DrawLevelMeter(const char* label, float db, bool clipping)
+{
+	const bool silent = !std::isfinite(db);
+	const float fraction = MeterFraction(db);
+
+	ImVec4 colour(0.25f, 0.70f, 0.35f, 1.0f);  // comfortable
+
+	if (clipping || db >= 0.0f)
+	{
+		colour = ImVec4(0.90f, 0.25f, 0.25f, 1.0f);  // clipping
+	}
+	else if (db >= kMeterHotDb)
+	{
+		colour = ImVec4(0.95f, 0.55f, 0.15f, 1.0f);  // about to
+	}
+	else if (db >= kMeterWarnDb)
+	{
+		colour = ImVec4(0.90f, 0.80f, 0.20f, 1.0f);  // getting hot
+	}
+
+	char overlay[32];
+
+	if (silent)
+	{
+		std::snprintf(overlay, sizeof(overlay), "--");
+	}
+	else
+	{
+		std::snprintf(overlay, sizeof(overlay), "%.1f dB", db);
+	}
+
+	ImGui::TextUnformatted(label);
+	ImGui::SameLine(90.0f);
+
+	ImGui::PushStyleColor(ImGuiCol_PlotHistogram, colour);
+	ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), overlay);
+	ImGui::PopStyleColor();
+
+	if (ImGui::IsItemHovered())
+	{
+		ImGui::SetTooltip("Peak since the last frame. 0 dB is full scale -- red means the signal is being clipped.");
+	}
+}
+
 // The browser holds every plugin on the machine, so it wants most of the
 // window rather than a corner of it.
 constexpr float kBrowserWidth = 560.0f;
@@ -514,10 +564,31 @@ void DrawBoard(BoardViewState& state, BoardViewUi& ui)
 	// there is no way to reach it.
 	const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 		ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-		ImGuiWindowFlags_NoBringToFrontOnFocus;
+		ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_MenuBar;
 
 	if (ImGui::Begin("Signalforge", nullptr, flags))
 	{
+		// SF-37: the first entry in what will grow into a general app menu.
+		// A menu bar rather than a button alongside the board content, so
+		// future entries have one obvious home instead of each needing their
+		// own spot found for them.
+		if (ImGui::BeginMenuBar())
+		{
+			if (ImGui::BeginMenu("Settings"))
+			{
+				if (ImGui::MenuItem("Audio Settings..."))
+				{
+					state.audio_settings_requested = true;
+				}
+
+				RecordWidgetNamed(state, "menu:audio-settings", true);
+
+				ImGui::EndMenu();
+			}
+
+			ImGui::EndMenuBar();
+		}
+
 		ImGui::TextUnformatted(state.preset_name.empty() ? "(no preset)" : state.preset_name.c_str());
 
 		if (!state.preset_path.empty() && ImGui::IsItemHovered())
@@ -653,10 +724,10 @@ void DrawBoard(BoardViewState& state, BoardViewUi& ui)
 				std::snprintf(buffer, sizeof(buffer), "%u frames", state.block_size);
 				DrawEngineRow("Block size", buffer);
 
-				// The live proof that audio is not on this thread: grab the
-				// title bar and drag, and this keeps climbing.
-				std::snprintf(buffer, sizeof(buffer), "%llu", static_cast<unsigned long long>(state.audio_cycles));
-				DrawEngineRow("Audio cycles", buffer);
+				// What a buffer-size change is actually traded against, so
+				// the two are worth seeing together.
+				std::snprintf(buffer, sizeof(buffer), "%.1f ms round trip", state.latency_ms);
+				DrawEngineRow("Latency", buffer);
 
 				std::snprintf(buffer, sizeof(buffer), "%zu", state.midi_bindings);
 				DrawEngineRow("MIDI bindings", buffer);
@@ -668,6 +739,20 @@ void DrawBoard(BoardViewState& state, BoardViewUi& ui)
 				}
 
 				ImGui::EndTable();
+			}
+
+			ImGui::Spacing();
+
+			// Below the table rather than in it: these change every frame,
+			// and a bar that needs to be wide is a bad fit for a two-column
+			// key/value layout built for short static strings.
+			DrawLevelMeter("Input", state.input_db, false);
+			DrawLevelMeter("Output", state.output_db, state.output_clipping);
+
+			if (state.output_clipping)
+			{
+				ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
+					"Output is clipping -- lower the level in the chain or at the interface.");
 			}
 		}
 

@@ -2,12 +2,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "imgui.h"
 
 #include "AppWindow.h"
+#include "AudioSettingsView.h"
 #include "BoardView.h"
 
 namespace sf
@@ -212,6 +214,11 @@ int RunUiSelfTest(int frames)
 	// condition, which the window has to show and which blocks saving.
 	bool degraded = false;
 
+	// What the level meters are fed. Hot but not clipping by default, so the
+	// coloured branches are exercised by every ordinary frame.
+	float meter_input_db = -4.0f;
+	float meter_output_db = -0.5f;
+
 	// Draws one frame, optionally with the mouse at `target` and the button in
 	// state `press`. Returns what the view reported, probes and all.
 	auto draw = [&](const WidgetProbe* target, bool press, const std::vector<BoardStage>* chain_stages)
@@ -234,7 +241,16 @@ int RunUiSelfTest(int frames)
 		view.preset_path = "(self-test)";
 		view.sample_rate = 48000.0;
 		view.block_size = 128;
-		view.audio_cycles = static_cast<uint64_t>(drawn);
+		view.latency_ms = 5.3;
+
+		// Levels the meter has to survive, varied by the caller so every
+		// branch is drawn: a normal hot signal by default, and silence
+		// (-INFINITY) and over-full-scale at the end. Both extremes reach
+		// the progress bar as a computed fraction, which is exactly where a
+		// non-finite value would otherwise become a crash or a wild bar.
+		view.input_db = meter_input_db;
+		view.output_db = meter_output_db;
+		view.output_clipping = degraded;
 		view.midi_bindings = 3;
 		view.current_preset = starting_preset;
 		view.presets = &presets;
@@ -897,6 +913,268 @@ int RunUiSelfTest(int frames)
 	// rather than a directory draws, which no normal session shows.
 	draw(nullptr, false, nullptr);
 
+	// The meter's scale mapping, asserted rather than merely drawn. Drawing
+	// alone proves very little here: Dear ImGui saturates a progress bar's
+	// fraction internally, so a mapping that returns 12.0 or NaN still
+	// *looks* fine while being wrong, and would stop looking fine the moment
+	// anything else consumed it.
+	{
+		struct MeterCase
+		{
+			float db;
+			float expected;
+			const char* what;
+		};
+
+		const MeterCase cases[] = {
+			{-INFINITY, 0.0f, "silence sits at the bottom"},
+			{std::numeric_limits<float>::quiet_NaN(), 0.0f, "NaN sits at the bottom rather than anywhere"},
+			{-120.0f, 0.0f, "below the floor is the floor"},
+			{-60.0f, 0.0f, "the floor itself"},
+			{-30.0f, 0.5f, "halfway up"},
+			{0.0f, 1.0f, "full scale fills the bar"},
+			{6.0f, 1.0f, "past full scale still just fills it"},
+			{INFINITY, 0.0f, "positive infinity is not a level either"},
+		};
+
+		for (const MeterCase& test : cases)
+		{
+			const float got = MeterFraction(test.db);
+
+			if (!(got >= 0.0f && got <= 1.0f) || std::fabs(got - test.expected) > 0.001f)
+			{
+				std::fprintf(stderr, "FAIL: meter fraction for %s: got %f, expected %f.\n", test.what,
+					static_cast<double>(got), static_cast<double>(test.expected));
+				return 1;
+			}
+		}
+	}
+
+	// And the same extremes actually drawn, since the bar, its overlay text
+	// and its colour choice all read the level too.
+	{
+		meter_input_db = -INFINITY;
+		meter_output_db = -INFINITY;
+		draw(nullptr, false, nullptr);
+
+		meter_input_db = 6.0f;   // well past full scale
+		meter_output_db = 2.5f;
+		degraded = false;
+		draw(nullptr, false, nullptr);
+
+		// NaN is not a level any correct code produces, but it is what a
+		// divide-by-zero upstream would hand this, and a meter is not worth
+		// crashing the board over.
+		meter_input_db = std::numeric_limits<float>::quiet_NaN();
+		meter_output_db = std::numeric_limits<float>::quiet_NaN();
+		draw(nullptr, false, nullptr);
+
+		meter_input_db = -4.0f;
+		meter_output_db = -0.5f;
+	}
+
+	// SF-38/39: the Audio Settings dialog. Its port list groups by device and
+	// offers two granularities per group, which is real layout logic that
+	// nothing else exercises. Drawn against a synthetic graph shaped like the
+	// awkward real one: a multi-channel interface (so a device row *and* its
+	// individual ports both appear), a single-port device (so the no-device-
+	// row branch is taken), and a saved selection naming hardware that isn't
+	// in the list at all (the "not connected" preservation path).
+	{
+		const std::vector<AudioSettingsJackPort> jack_ports = {
+			{"Scarlett:capture_AUX0", "Scarlett", "capture_AUX0", true},
+			{"Scarlett:capture_AUX1", "Scarlett", "capture_AUX1", true},
+			{"Razer:capture_MONO", "Razer", "capture_MONO", true},
+			{"Scarlett:playback_FL", "Scarlett", "playback_FL", false},
+			{"Scarlett:playback_FR", "Scarlett", "playback_FR", false},
+		};
+
+		const std::vector<AudioSettingsDevice> devices = {{"hw:0", "Scarlett Solo (hw:0)", "Scarlett"}};
+
+		// Persistent across frames, the way the real dialog's state is: a
+		// combo stays open between frames, which is the whole point here.
+		AudioSettingsViewState audio;
+		audio.server_running = true;
+		audio.jack_ports = &jack_ports;
+		audio.devices = &devices;
+		audio.input_filter = "Scarlett:capture_AUX1";  // an exact channel
+		audio.output_filter = "Scarlett";              // a whole device
+		audio.record_widgets = true;
+
+		auto draw_audio = [&](const WidgetProbe* aim, bool pressed)
+		{
+			ImGuiIO& io = ImGui::GetIO();
+
+			if (aim)
+			{
+				io.AddMousePosEvent(aim->x, aim->y);
+				io.AddMouseButtonEvent(0, pressed);
+			}
+
+			if (!window.BeginFrame())
+			{
+				closed_early = true;
+				return;
+			}
+
+			audio.widgets.clear();
+			audio.apply_requested = false;
+			audio.cancel_requested = false;
+
+			DrawAudioSettings(audio);
+			window.EndFrame();
+			++drawn;
+		};
+
+		auto click_audio = [&](const char* id)
+		{
+			const WidgetProbe* target = Find(audio.widgets, id);
+
+			if (!target)
+			{
+				std::fprintf(stderr, "FAIL: the audio dialog never drew a widget called '%s'.\n", id);
+				return false;
+			}
+
+			const WidgetProbe aim = *target;
+
+			draw_audio(&aim, false);
+			draw_audio(&aim, true);
+			draw_audio(&aim, false);
+
+			return true;
+		};
+
+		draw_audio(nullptr, false);
+		draw_audio(nullptr, false);
+
+		// Nothing was clicked, so nothing may have changed.
+		if (audio.input_filter != "Scarlett:capture_AUX1" || audio.output_filter != "Scarlett")
+		{
+			std::fprintf(stderr, "FAIL: drawing the audio dialog altered the selection.\n");
+			return 1;
+		}
+
+		if (audio.apply_requested || audio.cancel_requested)
+		{
+			std::fprintf(stderr, "FAIL: the audio dialog reported a click nobody made.\n");
+			return 1;
+		}
+
+		// Open the input dropdown. Only then do its rows exist at all -- which
+		// is exactly why this has to be a real click and not just a redraw.
+		if (!closed_early && !click_audio("audio-input:combo"))
+		{
+			return 1;
+		}
+
+		// A popup is positioned by the frame after it opens, so the row
+		// coordinates reported on the opening frame are not yet where the
+		// rows will be. Aiming at those hits empty space *outside* the
+		// popup, which dismisses it -- so settle first, then aim.
+		for (int i = 0; i < kSettleFrames && !closed_early; ++i)
+		{
+			draw_audio(nullptr, false);
+		}
+
+		if (!closed_early)
+		{
+			// A capture-only list: the Scarlett's two inputs, the Razer's one,
+			// and a device row for the Scarlett because it has more than one.
+			// The playback ports must not be here -- offering an output as an
+			// input is offering a setting that cannot work.
+			if (!Find(audio.widgets, "audio-input:port:Scarlett:capture_AUX0") ||
+				!Find(audio.widgets, "audio-input:port:Scarlett:capture_AUX1") ||
+				!Find(audio.widgets, "audio-input:port:Razer:capture_MONO") ||
+				!Find(audio.widgets, "audio-input:device:Scarlett"))
+			{
+				std::fprintf(stderr, "FAIL: the input dropdown did not list every capture port and device.\n");
+				return 1;
+			}
+
+			if (Find(audio.widgets, "audio-input:port:Scarlett:playback_FL"))
+			{
+				std::fprintf(stderr, "FAIL: the input dropdown offered a playback port.\n");
+				return 1;
+			}
+
+			// The single-port Razer gets no device row: it would mean exactly
+			// the same thing as its one port row.
+			if (Find(audio.widgets, "audio-input:device:Razer"))
+			{
+				std::fprintf(stderr, "FAIL: a one-port device was given a redundant 'all ports' row.\n");
+				return 1;
+			}
+
+			// Pick the *other* channel of the same interface -- the thing a
+			// mono board needs and a device-only list could never express.
+			if (!click_audio("audio-input:port:Scarlett:capture_AUX0"))
+			{
+				return 1;
+			}
+
+			if (audio.input_filter != "Scarlett:capture_AUX0")
+			{
+				std::fprintf(stderr, "FAIL: choosing a channel set the filter to '%s'.\n", audio.input_filter.c_str());
+				return 1;
+			}
+
+			// Choosing an input must not disturb the output: they are separate
+			// settings, and conflating them is the bug this pair replaced.
+			if (audio.output_filter != "Scarlett")
+			{
+				std::fprintf(stderr, "FAIL: choosing an input changed the output to '%s'.\n",
+					audio.output_filter.c_str());
+				return 1;
+			}
+		}
+
+		// A saved port whose hardware isn't present must survive being drawn
+		// *and* being looked at -- the row is inside the open dropdown, so
+		// this only means anything with the combo open.
+		if (!closed_early)
+		{
+			audio.input_filter = "SomeInterfaceThatIsUnplugged:capture_1";
+
+			draw_audio(nullptr, false);
+
+			if (!click_audio("audio-input:combo"))
+			{
+				return 1;
+			}
+
+			for (int i = 0; i < kSettleFrames && !closed_early; ++i)
+			{
+				draw_audio(nullptr, false);
+			}
+
+			if (!Find(audio.widgets, "audio-input:unavailable"))
+			{
+				std::fprintf(stderr, "FAIL: an unplugged device's saved port was not offered back to the user.\n");
+				return 1;
+			}
+
+			if (audio.input_filter != "SomeInterfaceThatIsUnplugged:capture_1")
+			{
+				std::fprintf(stderr, "FAIL: opening the dropdown dropped an unplugged device's saved port ('%s').\n",
+					audio.input_filter.c_str());
+				return 1;
+			}
+
+			// Close it again without choosing anything.
+			if (!click_audio("audio-input:combo"))
+			{
+				return 1;
+			}
+
+			if (audio.input_filter != "SomeInterfaceThatIsUnplugged:capture_1")
+			{
+				std::fprintf(stderr, "FAIL: closing the dropdown dropped an unplugged device's saved port.\n");
+				return 1;
+			}
+		}
+	}
+
 	if (closed_early)
 	{
 		std::fprintf(stderr, "FAIL: window closed before the checks finished.\n");
@@ -906,7 +1184,7 @@ int RunUiSelfTest(int frames)
 	window.Close();
 
 	std::printf("UI: PASS (drew %d frame(s), %zu stage interaction(s), %zu learn target(s), plugin browser, controls, "
-		"file picker, disabled states)\n",
+		"file picker, audio settings, disabled states)\n",
 		drawn, std::size(kSteps), std::size(kLearnSteps) + 1);
 
 	(void)frames;

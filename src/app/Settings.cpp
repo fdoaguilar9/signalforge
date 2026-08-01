@@ -42,6 +42,8 @@ void Settings::Clamp()
 	window_height = std::min(kMaxWindowSize, std::max(kMinWindowSize, window_height));
 
 	crossfade_ms = Crossfade::ClampMilliseconds(crossfade_ms);
+
+	audio.Clamp();
 }
 
 nlohmann::json Settings::ToJson() const
@@ -50,6 +52,7 @@ nlohmann::json Settings::ToJson() const
 		{"window", {{"width", window_width}, {"height", window_height}}},
 		{"last_preset", last_preset},
 		{"crossfade", {{"milliseconds", crossfade_ms}, {"curve", ToString(crossfade_curve)}}},
+		{"audio", audio.ToJson()},
 	};
 }
 
@@ -100,6 +103,11 @@ Settings Settings::FromJson(const nlohmann::json& json)
 			// file: a typo shouldn't cost you your window size as well.
 			ParseCrossfadeCurve(crossfade["curve"].get<std::string>(), out.crossfade_curve);
 		}
+	}
+
+	if (json.contains("audio") && json["audio"].is_object())
+	{
+		out.audio = AudioConfig::FromJson(json["audio"]);
 	}
 
 	out.Clamp();

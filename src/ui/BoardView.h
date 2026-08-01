@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -91,6 +93,35 @@ struct BoardFileEntry
 
 // "No preset selected" / "nothing requested". Not an index into anything.
 inline constexpr size_t kNoPreset = static_cast<size_t>(-1);
+
+// The level meter's scale. The floor is where the bar bottoms out: below this
+// a guitar signal is inaudible anyway, and spending scale on it would squash
+// the part that matters into a sliver. The other two are where the bar
+// changes colour -- -6 dBFS is the usual "getting hot" mark, and -1 is close
+// enough to full scale that the next transient may not fit.
+inline constexpr float kMeterFloorDb = -60.0f;
+inline constexpr float kMeterWarnDb = -6.0f;
+inline constexpr float kMeterHotDb = -1.0f;
+
+// Where a level sits on that scale, always within 0..1.
+//
+// Pure and inline so the mapping can be asserted directly rather than only
+// looked at: the interesting inputs are the ones that aren't ordinary
+// numbers. Silence arrives as -INFINITY (log10 of zero), a clipping signal
+// exceeds 0 dBFS, and a divide-by-zero upstream would hand this a NaN. Left
+// unguarded, each becomes a fraction outside 0..1 -- which a drawing library
+// may quietly saturate today and not tomorrow.
+inline float MeterFraction(float db)
+{
+	if (!std::isfinite(db))
+	{
+		return 0.0f;
+	}
+
+	const float clamped = std::min(0.0f, std::max(kMeterFloorDb, db));
+
+	return (clamped - kMeterFloorDb) / -kMeterFloorDb;
+}
 
 // One installed plugin, as the browser needs to show it. Built once from
 // lilv; scanning the world is far too slow to do while drawing.
@@ -199,10 +230,26 @@ struct BoardViewState
 	double sample_rate = 0.0;
 	uint32_t block_size = 0;
 
-	// Audio callbacks completed since start. A counter that keeps climbing
-	// while the window is being dragged is the whole point of SF-24: it says
-	// the sound is not coming from this thread.
-	uint64_t audio_cycles = 0;
+	// Round-trip latency in milliseconds, as JACK reports it. The number a
+	// player actually cares about -- it's the delay between the string and
+	// the speaker, and it is what a buffer-size change is traded against.
+	double latency_ms = 0.0;
+
+	// Peak levels since the last frame, in dBFS, with 0 dBFS being full
+	// scale. -INFINITY for silence.
+	//
+	// dB rather than raw magnitude because the useful part of a meter is all
+	// squeezed into the top of a linear scale: the difference between a good
+	// level and a clipping one is 0.5 to 1.0 linear, but a legible -6 to 0
+	// in dB.
+	float input_db = -INFINITY;
+	float output_db = -INFINITY;
+
+	// Whether the output has hit full scale recently enough to still be worth
+	// shouting about. The caller decides how long "recently" is -- the engine
+	// only counts clipped blocks, and how long a warning should stay up is a
+	// UI judgement, not an audio one.
+	bool output_clipping = false;
 
 	uint64_t midi_drops = 0;
 	size_t midi_bindings = 0;
@@ -297,6 +344,11 @@ struct BoardViewState
 
 	// Set by the view when the user asks to stop.
 	bool quit_requested = false;
+
+	// SF-37: set when "Audio Settings..." is picked from the menu bar. The
+	// menu bar is the first entry in what will grow into a general app menu;
+	// this is its only item so far.
+	bool audio_settings_requested = false;
 
 	// Testing aid, off by default. When set, the view records where each
 	// interactive widget landed and whether it was clickable, so the self-test

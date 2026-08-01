@@ -76,9 +76,25 @@ add_test(NAME crossfade COMMAND crossfade_test)
 
 # Remembered window size, last preset, and crossfade settings: every way a
 # settings file can be wrong, and the fact that none of them stops the board.
-add_executable(settings_test tests/SettingsTest.cpp src/app/Settings.cpp src/audio/Crossfade.cpp)
+add_executable(settings_test tests/SettingsTest.cpp src/app/Settings.cpp src/audio/Crossfade.cpp src/audio/AudioConfig.cpp)
+target_link_libraries(settings_test PkgConfig::JACK)
 target_include_directories(settings_test PRIVATE src/third_party)
 add_test(NAME settings COMMAND settings_test)
+
+# The audio backend config model: JSON round-trip, clamping, and ALSA device
+# enumeration on whatever machine this runs on. Never starts a JACK server --
+# IsJackServerRunning only probes.
+add_executable(audio_config_test tests/AudioConfigTest.cpp src/audio/AudioConfig.cpp)
+target_link_libraries(audio_config_test PkgConfig::JACK)
+add_test(NAME audio_config COMMAND audio_config_test)
+
+# The jackd lifecycle manager. Exercises the failure paths (no server, no
+# jackd, or a bogus device) that are the only ones a plain CI sandbox can
+# reach -- the happy path (spawning a real jackd against a real card) is
+# covered live, not here.
+add_executable(jack_server_test tests/JackServerTest.cpp src/jack/JackServer.cpp src/audio/AudioConfig.cpp)
+target_link_libraries(jack_server_test PkgConfig::JACK)
+add_test(NAME jack_server COMMAND jack_server_test)
 
 # The tuning table SF-33's by-ear pass was made against. Cheap to run, and it
 # fails if the curves ever stop being what they claim.

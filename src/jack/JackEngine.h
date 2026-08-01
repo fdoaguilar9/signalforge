@@ -91,6 +91,42 @@ public:
 	// control-thread operation shows whether audio kept flowing during it.
 	uint64_t ProcessCycleCount() const { return process_count_.load(std::memory_order_acquire); }
 
+	// Loudest sample magnitude seen since the previous call, and reset to
+	// zero by it -- "peak since you last looked", which is what a meter
+	// wants. Control thread only.
+	//
+	// Read-and-reset rather than a running value because the audio thread
+	// runs far faster than the UI redraws: a plain snapshot would show one
+	// arbitrary block out of every six and miss the transient that matters.
+	float TakeInputPeak() { return input_peak_.exchange(0.0f, std::memory_order_relaxed); }
+	float TakeOutputPeak() { return output_peak_.exchange(0.0f, std::memory_order_relaxed); }
+
+	// Monotonic count of blocks in which at least one output sample reached
+	// full scale. A count rather than a flag so the reader can tell "clipping
+	// right now" from "clipped a while ago" by watching it change, without
+	// the engine having to know anything about how long a warning should
+	// stay on screen.
+	uint64_t OutputClipCount() const { return output_clips_.load(std::memory_order_relaxed); }
+
+	// Round-trip latency in milliseconds, as JACK reports it: hardware in to
+	// our input port, plus our output port to hardware out. Falls back to one
+	// period when the ports aren't connected to anything and JACK therefore
+	// reports zero -- that's the floor no client can beat, not a claim the
+	// real figure is that low.
+	double RoundTripLatencyMs() const;
+
+	// Asks the server to change its period size, live. Legal on a running
+	// JACK server and it affects every client on it, ours included -- there
+	// is no per-client buffer size.
+	//
+	// **The caller must make sure the running chain can already take the new
+	// size before calling this**: the change takes effect on the audio thread
+	// as soon as the server agrees, while the old chain is still processing,
+	// and an LV2 plugin handed more frames than it was instantiated for
+	// writes past the end of its buffers. Build (and swap in) a chain whose
+	// maximum block covers both sizes first.
+	bool SetBufferSize(uint32_t frames);
+
 	// Pops one MIDI event received since the last call, if any. Control
 	// thread only -- the audio thread just parses and enqueues, since it
 	// can't log or allocate.
@@ -121,11 +157,48 @@ public:
 	// engine must be activated for connections to hold.
 	std::vector<std::string> ConnectMidiInputs(const std::string& device_filter);
 
+	// Connects our registered audio ports to physical hardware ports (SF-39):
+	// our in_N ports to hardware capture ports, our out_N ports to hardware
+	// playback ports (the mono->stereo mirror port included). Matched by
+	// position after sorting by name, bounded by however many of each exist
+	// on either side -- a two-in pedalboard on a four-in interface gets the
+	// first two capture ports, not all four.
+	//
+	// An empty filter matches every physical port of the right direction,
+	// same convention as ConnectMidiInputs. A non-empty one is a
+	// case-insensitive substring match on the port name and is the only way
+	// to reach a non-physical (software) port.
+	//
+	// Returns the port name pairs actually connected, as "ours -> theirs"
+	// strings, for logging. Call after Start().
+	std::vector<std::string> ConnectAudioPorts(const std::string& input_filter, const std::string& output_filter);
+
+	// Drops every connection on our audio ports, leaving the engine running
+	// and the ports registered. Paired with ConnectAudioPorts to re-point the
+	// board at different hardware *without* restarting the engine or the
+	// server -- changing which device feeds the board doesn't need either,
+	// and doing it this way costs no audio gap beyond the reconnection
+	// itself.
+	void DisconnectAudioPorts();
+
 	void Close();
 
 private:
 	static int ProcessCallback(jack_nframes_t nframes, void* arg);
 	int Process(jack_nframes_t nframes);
+
+	// JACK calls this with processing stopped, so it may allocate -- which is
+	// the only reason the crossfade scratch buffers can be resized at all.
+	static int BufferSizeCallback(jack_nframes_t nframes, void* arg);
+	void ResizeScratch(uint32_t frames);
+
+	// Peak magnitude since the control thread last read it, written by the
+	// audio thread. Relaxed throughout: a meter that is one block stale is
+	// not wrong in any way a player could see, and ordering it against the
+	// audio would cost more than it's worth.
+	std::atomic<float> input_peak_{0.0f};
+	std::atomic<float> output_peak_{0.0f};
+	std::atomic<uint64_t> output_clips_{0};
 
 	jack_client_t* client_ = nullptr;
 

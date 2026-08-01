@@ -1014,12 +1014,332 @@ a hard dependency chain, except where noted.
   it is a setting now: `--crossfade-ms 8` and stomp, then keep what you
   like in the settings file.
 
-## Milestone 8 — Binary split/merge (later)
+## Milestone 8 — Audio device configuration
 
-- [ ] **SF-34**: Extend the chain data model from a flat list to the
+Today `JackEngine::Open()` just connects as a plain JACK client to whatever
+server is already running (started externally via `jackd`/`pipewire-jack`);
+device, driver, sample rate and buffer size are entirely out of the app's
+hands. This milestone changes that: on a machine with no server running,
+SignalForge starts and owns its own `jackd`, with the driver/device/rate/
+buffer chosen through a config UI. A native (no-JACK) ALSA backend is
+explicitly deferred to a later milestone — everything here still goes
+through JACK, just a JACK the app can configure and launch itself.
+
+- [x] **SF-34**: Audio backend config data model + enumeration.
+  `src/audio/AudioConfig.h/.cpp`: `AudioConfig` (driver, device, sample
+  rate, buffer size, input/output port filters, `configured` flag) with
+  JSON (de)serialization and clamping; `EnumerateAlsaDevices()` (parses
+  `/proc/asound/cards`); `IsJackServerRunning()` (a side-effect-free
+  `jack_client_open(..., JackNoStartServer, ...)` probe). `--list-audio-devices`
+  prints both. Covered by the `audio_config` ctest (clamping, JSON
+  round-trip and tolerance of wrong-typed/unknown fields, and enumeration
+  sanity on whatever machine it runs on — this repo's dev box reports 4
+  ALSA cards).
+- [x] **SF-35**: JACK server lifecycle manager. `src/jack/JackServer.h/.cpp`:
+  `EnsureRunning()` is a no-op (`OwnsServer() == false`) when a server is
+  already reachable; otherwise forks/execs `jackd -R -d alsa [-d <device>]
+  -r <rate> -p <buffer>` and polls until it accepts clients or a timeout
+  elapses. `Stop()` only ever touches a server *we* started — SIGTERM, then
+  SIGKILL after a grace period — and is a no-op otherwise, including
+  implicitly via the destructor. Orphan prevention on a crash uses
+  `PR_SET_PDEATHSIG` in the child, belt-and-braces alongside the clean-exit
+  `Stop()` call.
+  **`JACK_NO_START_SERVER` is honoured**, not just left to libjack's own
+  auto-start: without this, setting it to stop libjack auto-starting a
+  server would do nothing, since we'd start one ourselves right after.
+  This is also what keeps the `resume_preset` ctest (which points at a
+  JACK server that deliberately doesn't exist, with that variable set, to
+  fail fast without touching real audio) from spawning a real `jackd`
+  during `ctest`.
+  Covered by the `jack_server` ctest: `Stop()` without a start is a no-op;
+  `driver: "external"` refuses to spawn when no server is actually up;
+  a missing/failing `jackd` fails cleanly rather than hanging (this dev
+  box has no `jackd` binary at all — `pipewire-jack` provides the JACK API
+  without it — so this is the path exercised here); and
+  `JACK_NO_START_SERVER` is honoured. The happy path — a real `jackd`
+  against a real card — needs a machine with `jackd` installed and is not
+  covered by ctest here.
+- [x] **SF-36**: First-run detection + blocking config step, in
+  `ResolveAudioConfig()`. `settings.audio.configured == false` (first run,
+  or after `--reconfigure-audio`) is what triggers it; a server already
+  reachable short-circuits straight to `driver: "external"` with no
+  question asked. Otherwise: `ResolveAudioConfigCli()` prompts on stdin,
+  but only when one is attached (`isatty`) — a non-interactive run (a
+  script, a systemd unit, `ctest`) gets the defaults and a one-line notice
+  instead of hanging forever waiting for input that will never come.
+  `--gui` instead opens a small standalone window (`ResolveAudioConfigGui`,
+  reusing SF-38's dialog) *before* the real board window exists, since the
+  board only opens once the engine is already up — confirmed live: with no
+  server reachable and `--gui`, the process blocks on the dialog exactly as
+  intended (verified by timeout, since nothing here can click a real
+  button) rather than proceeding or crashing.
+  Runs before `JackServer`/`JackEngine` touch anything, so a config mistake
+  is caught before any audio device is opened.
+- [x] **SF-37**: App menu bar, in `BoardView`'s single fullscreen window
+  (`ImGuiWindowFlags_MenuBar`, a "Settings" menu with one item so far).
+  `BoardViewState::audio_settings_requested` is how the view reports the
+  click, the same borrow-a-flag pattern as every other request in that
+  struct — the view still doesn't know what an audio device is.
+- [x] **SF-38**: Audio Settings dialog. `src/ui/AudioSettingsView.h/.cpp`
+  (`DrawAudioSettings`), reused three ways: SF-36's first-run window, the
+  menu-triggered floating dialog over a running board, and the same struct
+  either drives. Applying calls `restart_audio_engine()` in `main.cpp`.
+  **Honest about the one thing it can't hide**: changing device/rate/buffer
+  means restarting the JACK server itself when we manage it, which takes
+  every client down, ours included — there is no crossfade-style trick
+  available here, unlike a preset switch. What *is* guarded against is a
+  *failed* change leaving the board silent afterward:
+  `restart_audio_engine` tries the requested config first and, if it
+  doesn't come up clean (bad device, `jackd` failure, chain rebuild
+  failure), falls back to reopening the config that was working before, so
+  "the new setting didn't work" doesn't compound into "and now nothing
+  plays" — only a config that was *also* broken in the meantime (e.g. the
+  previously-working device unplugged mid-restart) ends in a stopped-audio
+  state, reported in the dialog rather than crashing.
+  A same-sample-rate change (buffer size, device) reuses the running
+  `Chain` as-is; a sample-rate change rebuilds it via
+  `BuildChainFromPreset` at the new rate, since an LV2 plugin instance is
+  bound to the rate it was instantiated with. Fixed a real bug found while
+  writing this: the fallback attempt originally compared against the rate
+  *at the start of the whole call*, not the rate the (possibly already
+  rebuilt) `chain` variable actually held at that point — a forward attempt
+  that rebuilt the chain and only then failed at `Start()` would have left
+  the fallback reusing a chain built for the wrong rate. Fixed by tracking
+  `chain_sample_rate` as its own variable, updated exactly when `chain` is.
+  `JackEngine::SampleRate()`/`MaxBlockSize()` now return 0 rather than
+  crash when called on a closed engine (`client_ == nullptr`), which the
+  double-failure path above can leave outstanding until the user tries
+  again — same "never the reason a board won't play" posture as `Settings`.
+  Not covered end-to-end for the same reason as SF-28/29/30: real GUI
+  clicking needs the KDE input-injection permission that's the user's to
+  grant, not mine. What's verified is that everything compiles and runs
+  clean, the full ctest suite (21 tests) stays green with the wiring in
+  place, and the CLI/first-run halves of the same code paths behave live
+  (above).
+- [x] **SF-39**: Physical audio input/output port selection.
+  `JackEngine::ConnectAudioPorts()` mirrors `ConnectMidiInputs` for audio:
+  hardware capture ports (JACK outputs) feed our `in_N` ports, our `out_N`
+  (mirror included) feed hardware playback ports (JACK inputs), matched by
+  position after sorting by name and bounded by whichever side has fewer —
+  a two-in board on a four-in interface gets the first two capture ports,
+  not all four. An empty filter (`AudioConfig::input_ports`/`output_ports`)
+  matches every physical port of the right direction, same convention as
+  SF-20's MIDI filter; a named one is a case-insensitive substring match
+  and reaches non-physical ports too. Called after `engine.Start()` (that's
+  where `in_N`/`out_N` actually get registered) in both the initial run and
+  every `restart_audio_engine` call.
+
+  **Three real bugs found live, on real hardware (a Scarlett Solo and a
+  Razer mic both present), none of them caught by ctest since all three
+  need an actual multi-device JACK graph to manifest:**
+  (1) `JackServer::EnsureRunning` short-circuits to "do nothing" whenever a
+  server is already reachable — correct for not stomping on a server we
+  don't own, but on a PipeWire machine (no standalone `jackd` process, so
+  "already reachable" is always true) it meant `AudioConfig::device` was
+  silently never used at all. Device selection only ever took effect on
+  the machine where nobody needed it to.
+  (2) With an empty port filter, `ConnectAudioPorts` grabs the first N
+  physical ports sorted alphabetically — with two interfaces in the same
+  graph, whichever sorted first won, independent of anything the dialog
+  showed as selected. Between the two bugs, picking "Scarlett" in Audio
+  Settings had no effect and the board connected to the Razer mic instead.
+  Fixed by adding an explicit, always-visible, user-editable **port name
+  filter** field to the dialog (`AudioSettingsViewState::port_filter`,
+  same case-insensitive-substring convention as SF-20's MIDI device
+  filter) rather than trying to guess PipeWire's exact port-naming scheme
+  and trust it blindly — picking an ALSA device fills the field with a
+  guess (`GuessPortFilter`, the text after the card's " - " separator),
+  but the field itself is what's actually applied, so a wrong guess is
+  correctable by hand.
+  **Improved further**: rather than lean on that guess at all when it can
+  be avoided, `AudioConfig::EnumeratePhysicalPortClients()` asks the
+  reachable server directly for every distinct client name behind a
+  physical port (grouped, with capture/playback counts) and the dialog
+  offers those in a second, authoritative dropdown ("Detected hardware")
+  that fills the same filter field with the server's own name for the
+  hardware, not a guess. Only available once a server exists to ask —
+  during SF-36's first-run step, before one does, the ALSA-based guess is
+  still what's on offer, same as before. Covered by the
+  `TestEnumeratePhysicalPortClients` case in the `audio_config` ctest
+  (well-formed entries, and that a server known unreachable yields an
+  empty list rather than stale/fabricated data).
+  Sample rate/buffer fields are now
+  hidden only when a server is already running (they're genuinely not
+  ours to set there); the device/filter controls stay visible either way,
+  since picking ports is a client-side operation independent of who owns
+  the server.
+  **And split in two, which was the remaining half of the same bug.** One
+  shared filter drove both directions, so the input and the output could
+  never be different hardware — but a guitar in a Scarlett with the sound
+  going out to headphones on the motherboard codec is the ordinary desk,
+  not an exotic one. `AudioSettingsViewState` now carries `input_filter`
+  and `output_filter` separately, each with its own dropdown built by
+  `DrawPortSelector` from the live enumeration and filtered to devices
+  that actually have ports in that direction (a playback-only sink is
+  never offered as an input, since choosing it could only fail), plus its
+  own text field for the two cases a dropdown can't serve: hardware that
+  isn't plugged in right now, and first-run setup where no server exists
+  to enumerate. `AudioConfig` already stored the two independently, so
+  persistence needed no change; the `audio_config` ctest round-trips them
+  with deliberately *different* values, which is what keeps them from
+  being quietly conflated again.
+  Applying a device change no longer restarts anything: when only the
+  filters differ (same card, rate and buffer), the apply path calls the
+  new `JackEngine::DisconnectAudioPorts()` and re-runs
+  `ConnectAudioPorts()`, since re-pointing the board at other hardware is
+  a change of patching, not of the engine or the server. The full restart
+  is kept for changes that genuinely touch the server's own settings.
+
+  **Then made per-port rather than per-device, and the text fields
+  dropped.** Enumeration returns individual ports (`PhysicalPort` /
+  `EnumeratePhysicalPorts`) instead of devices with port counts: the chain
+  is mono, so *which* input of an interface the guitar is in is precisely
+  the choice being made, and a Scarlett Solo shown as one row reading "2
+  inputs" hides the only thing worth picking. The free-text filter fields
+  went with it -- a dropdown that can express everything worth choosing
+  makes a second way to say the same thing just a second thing to get out
+  of sync.
+  Dropping to ports alone would have broken output, though, and this is
+  worth stating because it was nearly shipped: the board feeds a stereo
+  pair (`out_1`/`out_2`), so an exact single playback port would have put
+  the sound in one ear. So each dropdown offers **two granularities** --
+  a whole device ("all N ports", what an output wants) and each individual
+  port (what a mono input wants) -- rather than guessing per direction. A
+  device with one port in that direction gets one row, not two identical
+  ones.
+  A saved port whose hardware isn't plugged in today is preserved rather
+  than silently reset: shown as the selection, offered back as a row
+  marked "not connected", so unplugging an interface for an evening
+  doesn't quietly rewrite the setting.
+  Verified by `ui_smoke`, which gained widget probes for this dialog
+  (`AudioSettingsViewState::record_widgets`, the same affordance
+  `BoardViewState` already had) because the rows only exist while the
+  dropdown is *open* -- reaching them needs a real click, not a redraw.
+  **The first version of this test was worthless and the injection pass is
+  what caught it**: it only drew the closed combo, so the dropdown body
+  never ran, and a deliberately planted "silently reset the saved value"
+  bug passed clean. Opening a popup also needs settle frames before its
+  row coordinates mean anything -- aiming at the opening frame's positions
+  lands outside the popup and dismisses it. With both fixed, three
+  injected regressions are each caught: dropping an unplugged device's
+  saved port, offering playback ports as inputs, and conflating the input
+  choice into the output (the original bug this whole thread started
+  from).
+  (3) A live-restart applying via the menu recorded `settings.audio =
+  config` verbatim, which always carried `driver: "alsa"` — even on the
+  common short-circuit path where no server was actually started by us.
+  The dialog's "already running" banner separately (and wrongly) checked
+  `driver == "external"` to decide what to show. Together these produced
+  an infinite loop: apply successfully attaches to the already-running
+  server, mislabels it "alsa", and the *next* time Settings is opened the
+  stale label makes the dialog claim nothing is running and prompt to
+  start a server that's already up. Fixed by keying both the display and
+  the record on `JackServer::OwnsServer()` — the actual fact of who
+  started it — instead of a copied config value.
+- [x] **SF-40**: Persist audio config in settings.json (extends SF-32).
+  `Settings::audio` (an `AudioConfig`) round-trips through `ToJson`/
+  `FromJson` and is clamped by `AudioConfig::Clamp()` on load, same
+  wrong-type/missing-key tolerance as the rest of `Settings`. `--reconfigure-audio`
+  clears `configured` for one run without hand-editing the file, the CLI
+  equivalent of opening the menu's Audio Settings.
+  Verified live: `--list-audio-devices` reports this dev box's 4 ALSA
+  cards; `--run-preset` with no `jackd` installed here fails cleanly with
+  "jackd exited immediately" rather than hanging, and writes nothing to
+  the settings file (consistent with settings only being saved at a
+  successful shutdown, same as before this milestone); the full ctest
+  suite passes (21/21, one pre-existing skip needing
+  `-DSIGNALFORGE_TEST_MODEL`) with the new `audio_config` and
+  `jack_server` tests included, and `resume_preset` — which deliberately
+  points at a JACK server that cannot exist — still passes unmodified,
+  confirming `JACK_NO_START_SERVER` keeps `ctest` from ever spawning a
+  real `jackd`.
+  **Not verified live, stated plainly**: this dev machine has no `jackd`
+  binary (PipeWire provides the JACK API directly), so the actual
+  spawn-a-server-and-play-audio happy path of SF-35/36/38 is exercised
+  only by code inspection and the failure-path tests above, not by an
+  end-to-end run against real hardware. Worth one live pass on a machine
+  with `jackd` installed: cold start with no preset, first-run dialog,
+  device/rate/buffer choice, audio out; then Audio Settings mid-session to
+  change buffer size and confirm playback survives it.
+
+- [x] **SF-41**: Level meters and latency in the engine panel; buffer size
+  adjustable live.
+
+  **Metering.** `JackEngine` measures peak magnitude on the audio thread --
+  inputs before the chain (so it says whether the *guitar* is too hot,
+  independently of what the plugins do with it) and outputs last of all, on
+  the buffers actually going to the interface, after any crossfade mix,
+  since a switch is exactly when two chains summing can push into clipping.
+  Peaks are published as "loudest since you last looked", reset by the
+  read: the audio thread runs ~375 blocks/s against a 60Hz redraw, so a
+  plain snapshot would show one arbitrary block in six and miss the
+  transient that matters. Written with a relaxed CAS loop rather than a
+  lock -- one writer, a reader that only ever swaps in zero, and nothing
+  that can block the audio thread.
+  Clipping is a monotonic count of full-scale blocks rather than a flag,
+  so the reader can tell "clipping now" from "clipped a moment ago" by
+  watching it change, and how long a warning stays up (1.5s) is decided in
+  the UI where it belongs rather than in the engine. Full scale is `>= 1.0`,
+  not `> 1.0`: a sample sitting exactly at 1.0 is already the top of the
+  range.
+  The bar itself has ballistics -- rises instantly, falls gradually --
+  because a bar driven straight off a read-and-reset peak flickers, showing
+  a transient for one frame and then nothing.
+
+  **Latency replaces the audio-cycle counter**, as asked. The cycle count
+  was SF-24's proof that audio isn't on the UI thread; it is still there in
+  `ProcessCycleCount()` and the `status` command, it just isn't what a
+  player wants in the panel. `RoundTripLatencyMs()` asks JACK
+  (`jack_port_get_latency_range`, capture on our input plus playback on our
+  output), so it accounts for the interface's own buffering and anything
+  patched around us rather than being computed from the period. Unconnected
+  ports report zero, which would read as "no latency at all", so that falls
+  back to one period -- the floor no client can beat, stated as such.
+
+  **Buffer size is now changeable from Audio Settings even on a server we
+  don't own**, because JACK supports it: `jack_set_buffer_size` changes the
+  period live. Sample rate deliberately stays behind the "we started this
+  server" condition, since the driver is opened at a rate and keeps it --
+  that asymmetry is real, not an oversight.
+  **The ordering here is the whole risk and is worth stating.** The new
+  period takes effect on the audio thread the moment the server agrees,
+  while the chain currently running is still the one processing it -- and
+  an LV2 plugin handed more frames than it was instantiated for writes past
+  the end of its buffers. So a chain whose maximum block covers *both* the
+  old and new size is built and crossfaded in first, and only then is the
+  size actually changed. A server that refuses the size leaves that
+  oversized chain in place, which is harmless: a maximum block is a
+  maximum, not a promise to fill it. `JackEngine` also grew a
+  buffer-size callback so the crossfade scratch is resized (legal to
+  allocate there -- JACK stops processing around it) instead of being
+  overflowed by the next fade.
+
+  Verified by `ui_smoke`, and **the meter test is worth recording as a
+  near-miss**. The first version only *drew* the meter at silence, past
+  full scale and NaN, and asserted nothing -- which caught nothing, because
+  Dear ImGui saturates a progress bar's fraction internally, so a mapping
+  returning 12.0 or NaN still looked fine. Injecting the obvious bug
+  (dropping the non-finite guard) passed clean. Fixed by extracting the
+  scale mapping into a pure, inline, directly assertable `MeterFraction`
+  and checking eight inputs including both infinities and NaN; two injected
+  regressions -- dropping the non-finite guard and dropping the clamp --
+  are each now caught. The drawing pass is kept alongside it, since the
+  bar's overlay text and colour choice read the level too.
+
+  Not covered end-to-end, same standing limitation as SF-28 through SF-30
+  and SF-38: that a real signal moves the real meter, and that a live
+  buffer-size change on a real server keeps audio running, both need
+  hardware and a real window. Worth one live pass: play, watch the input
+  meter track; push a gain stage until the output goes red; then change
+  buffer size from the menu and confirm the latency figure moves and the
+  sound survives it.
+
+## Milestone 9 — Binary split/merge (later)
+
+- [ ] **SF-43**: Extend the chain data model from a flat list to the
   `SeriesNode`/`SplitNode`/`MergeNode` tree described in PLAN.md §4.2,
   without changing v1 behavior (still produces linear chains).
-- [ ] **SF-35**: Add exactly one split/merge pair to the UI (PLAN.md
+- [ ] **SF-44**: Add exactly one split/merge pair to the UI (PLAN.md
   explicitly scopes this to *binary* — no nested/multiple splits).
 
 ---

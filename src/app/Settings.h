@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../audio/AudioConfig.h"
 #include "../audio/Crossfade.h"
 
 namespace sf
@@ -36,6 +37,11 @@ struct Settings
 	// handover from two takes of the same amp.
 	double crossfade_ms = Crossfade::kDefaultMilliseconds;
 	CrossfadeCurve crossfade_curve = CrossfadeCurve::EqualPower;
+
+	// SF-34/36/40. Driver/device/rate/buffer, and whether the audio backend
+	// has actually been configured yet -- `audio.configured == false` is
+	// what triggers the first-run config step.
+	AudioConfig audio;
 
 	// $XDG_CONFIG_HOME/signalforge/settings.json, or ~/.config/... when that
 	// isn't set. Empty if neither XDG_CONFIG_HOME nor HOME is set, which is
