@@ -1,41 +1,98 @@
 {
-  "chain": [
+  "graph": [
     {
       "bypassed": false,
       "controls": {
-        "input_level": 0.6209999918937683,
-        "output_level": -1.3880000114440918,
-        "quality_scale": 1.0
+        "bw1": 1.0,
+        "bw2": 1.0,
+        "bw3": 1.0,
+        "bw4": 1.0,
+        "enable": 1.0,
+        "filtog1": 1.0,
+        "filtog2": 1.0,
+        "filtog3": 1.0,
+        "filtog4": 1.0,
+        "filtogh": 1.0,
+        "filtogl": 1.0,
+        "freq1": 300.0,
+        "freq2": 1000.0,
+        "freq3": 2500.0,
+        "freq4": 6000.0,
+        "freqh": 9000.0,
+        "freql": 160.0,
+        "g1": 0.0,
+        "g2": 0.0,
+        "g3": 0.0,
+        "g4": 0.0,
+        "gh": 0.0,
+        "gl": 0.0,
+        "master": 0.0
       },
-      "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://github.com/mikeoliphant/neural-amp-modeler-lv2> ;\n\tstate:state [\n\t\t<http://github.com/mikeoliphant/neural-amp-modeler-lv2#model> <file:///home/fernando/Downloads/Mesa%20Boogie%20JP-2C%20Pack!/JP2C%20Capture%2019%20Petrucci%20Lead%20Current%20settings%20-%20Emil%20Rohbe.nam>\n\t] .\n",
-      "uri": "http://github.com/mikeoliphant/neural-amp-modeler-lv2"
+      "id": 9,
+      "uri": "urn:ardour:a-eq"
     },
     {
-      "bypassed": false,
-      "controls": {
-        "buffered": 1.0,
-        "dry": -60.0,
-        "enable": 1.0,
-        "wet": 0.0
-      },
-      "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://gareus.org/oss/lv2/zeroconvolv#CfgMono> ;\n\tstate:state [\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#channel_predelay> [\n\t\t\ta atom:Vector ;\n\t\t\tatom:childType atom:Int ;\n\t\t\trdf:value (\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t)\n\t\t] ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#predelay> \"0\"^^xsd:int ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#artificial_latency> \"0\"^^xsd:int ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#channel_gain> [\n\t\t\ta atom:Vector ;\n\t\t\tatom:childType atom:Float ;\n\t\t\trdf:value (\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t)\n\t\t] ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#gain> \"1.0\"^^xsd:float ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#sum_inputs> false ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#ir> <file:///home/fernando/The%20John%20Petrucci%20IR%20Collection%20-%20Vol.%201/03.%20DreamWorld%20Pack/48k%2016bit%20wav/Blends/DrmWrld-RHY%20blend+rm%20mesa%204x12%20recto.wav>\n\t] .\n",
-      "uri": "http://gareus.org/oss/lv2/zeroconvolv#CfgMono"
-    },
-    {
-      "bypassed": true,
-      "controls": {
-        "div": 4.0,
-        "dot": 0.0,
-        "drywet": 24.94499969482422,
-        "enable": 1.0,
-        "feedback": 11.35200023651123,
-        "gain": 0.0,
-        "inv": 0.0,
-        "lpf": 6000.0,
-        "sync": 0.0,
-        "time": 501.35101318359375
-      },
-      "uri": "urn:ardour:a-delay"
+      "branches": [
+        {
+          "gain_db": -9.600000381469727,
+          "muted": false,
+          "nodes": [
+            {
+              "bypassed": false,
+              "controls": {
+                "input_level": 0.0,
+                "output_level": 0.0,
+                "quality_scale": 1.0
+              },
+              "id": 5,
+              "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://github.com/mikeoliphant/neural-amp-modeler-lv2> ;\n\tstate:state [\n\t\t<http://github.com/mikeoliphant/neural-amp-modeler-lv2#model> <file:///home/fernando/Downloads/Mesa%20Boogie%20JP-2C%20Pack!/JP2C%20Capture%2018%20Ultimate%20Lead%20-%20Emil%20Rohbe.nam>\n\t] .\n",
+              "uri": "http://github.com/mikeoliphant/neural-amp-modeler-lv2"
+            },
+            {
+              "bypassed": false,
+              "controls": {
+                "buffered": 1.0,
+                "dry": -60.0,
+                "enable": 1.0,
+                "wet": 0.0
+              },
+              "id": 7,
+              "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://gareus.org/oss/lv2/zeroconvolv#CfgMono> ;\n\tstate:state [\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#channel_predelay> [\n\t\t\ta atom:Vector ;\n\t\t\tatom:childType atom:Int ;\n\t\t\trdf:value (\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t)\n\t\t] ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#predelay> \"0\"^^xsd:int ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#artificial_latency> \"0\"^^xsd:int ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#channel_gain> [\n\t\t\ta atom:Vector ;\n\t\t\tatom:childType atom:Float ;\n\t\t\trdf:value (\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t)\n\t\t] ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#gain> \"1.0\"^^xsd:float ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#sum_inputs> false ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#ir> <file:///home/fernando/The%20John%20Petrucci%20IR%20Collection%20-%20Vol.%201/03.%20DreamWorld%20Pack/48k%2016bit%20wav/Blends/DrmWrld-RHY%20blend+rm%20mesa%204x12%20recto.wav>\n\t] .\n",
+              "uri": "http://gareus.org/oss/lv2/zeroconvolv#CfgMono"
+            }
+          ]
+        },
+        {
+          "gain_db": -9.0,
+          "muted": false,
+          "nodes": [
+            {
+              "bypassed": false,
+              "controls": {
+                "input_level": 0.0,
+                "output_level": 0.0,
+                "quality_scale": 1.0
+              },
+              "id": 6,
+              "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://github.com/mikeoliphant/neural-amp-modeler-lv2> ;\n\tstate:state [\n\t\t<http://github.com/mikeoliphant/neural-amp-modeler-lv2#model> <file:///home/fernando/Downloads/Mesa%20Boogie%20JP-2C%20Pack!/JP2C%20Capture%2019%20Petrucci%20Lead%20Current%20settings%20-%20Emil%20Rohbe.nam>\n\t] .\n",
+              "uri": "http://github.com/mikeoliphant/neural-amp-modeler-lv2"
+            },
+            {
+              "bypassed": false,
+              "controls": {
+                "buffered": 1.0,
+                "dry": -60.0,
+                "enable": 1.0,
+                "wet": 0.0
+              },
+              "id": 8,
+              "state": "<urn:signalforge:stage-state>\n\ta pset:Preset ;\n\tlv2:appliesTo <http://gareus.org/oss/lv2/zeroconvolv#CfgMono> ;\n\tstate:state [\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#channel_predelay> [\n\t\t\ta atom:Vector ;\n\t\t\tatom:childType atom:Int ;\n\t\t\trdf:value (\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t\t\"0\"^^xsd:int\n\t\t\t)\n\t\t] ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#predelay> \"0\"^^xsd:int ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#artificial_latency> \"0\"^^xsd:int ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#channel_gain> [\n\t\t\ta atom:Vector ;\n\t\t\tatom:childType atom:Float ;\n\t\t\trdf:value (\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t\t\"1.0\"^^xsd:float\n\t\t\t)\n\t\t] ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#gain> \"1.0\"^^xsd:float ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#sum_inputs> false ;\n\t\t<http://gareus.org/oss/lv2/zeroconvolv#ir> <file:///home/fernando/The%20John%20Petrucci%20IR%20Collection%20-%20Vol.%201/03.%20DreamWorld%20Pack/48k%2016bit%20wav/Blends/DrmWrld-LD%20blend+rm%20mesa%204x12%20recto.wav>\n\t] .\n",
+              "uri": "http://gareus.org/oss/lv2/zeroconvolv#CfgMono"
+            }
+          ]
+        }
+      ],
+      "id": 4
     }
   ],
   "name": "Lead"

@@ -6,8 +6,13 @@ guitarists. Chain LV2 effects sequentially (including
 for amp modeling), save the chain as a preset, and switch presets live from
 any class-compliant USB MIDI foot controller.
 
-No drag-and-drop graph editor, no node-based patch bay — just an ordered
-effect chain you can build, save, and stomp through.
+No drag-and-drop, no node-based patch bay — a chain you read top to bottom,
+which can divide once into two parallel channels and merge back. You build it
+with buttons that say what they do, save it, and stomp through it.
+
+The interface is built against the design bundle in
+`design/design_handoff_pedalboard_ui/` — its tokens are the authority for
+colours, sizes and spacing, and `src/ui/Theme.h` is their transcription.
 
 ## Status
 

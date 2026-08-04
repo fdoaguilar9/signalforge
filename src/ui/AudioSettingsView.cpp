@@ -7,6 +7,9 @@
 
 #include "imgui.h"
 
+#include "Fonts.h"
+#include "Widgets.h"
+
 namespace sf
 {
 
@@ -15,6 +18,17 @@ namespace
 
 constexpr double kSampleRates[] = {44100.0, 48000.0, 88200.0, 96000.0};
 constexpr uint32_t kBufferSizes[] = {64, 128, 256, 512, 1024, 2048};
+
+// The design's 520px. Every select inside stacks full width rather than
+// sharing a row: the design's Select has a 260px minimum, and two of them side
+// by side overflow this -- the same arithmetic that decided the splitter
+// card's layout.
+constexpr float kModalWidth = 520.0f;
+
+// The popup's ImGui id, in one place: opening a popup and beginning one have
+// to agree on it exactly, and two spellings of the same title is a modal that
+// never appears.
+constexpr const char* kTitle = "Audio settings";
 
 enum class PortDirectionWanted
 {
@@ -34,7 +48,7 @@ void RecordWidget(AudioSettingsViewState& state, const std::string& id)
 	const ImVec2 low = ImGui::GetItemRectMin();
 	const ImVec2 high = ImGui::GetItemRectMax();
 
-	state.widgets.push_back({id, (low.x + high.x) * 0.5f, (low.y + high.y) * 0.5f, true});
+	state.widgets.push_back({id, (low.x + high.x) * 0.5f, (low.y + high.y) * 0.5f, ImGui::GetItemID(), true});
 }
 
 // One picker: a dropdown of what JACK currently reports in that direction.
@@ -128,7 +142,8 @@ void DrawPortSelector(AudioSettingsViewState& state, const char* probe_id, const
 		}
 	}
 
-	ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.75f);
+	// Full width and on its own row: see kModalWidth.
+	ImGui::SetNextItemWidth(-1.0f);
 
 	const bool open = ImGui::BeginCombo(label, preview.c_str());
 
@@ -213,13 +228,19 @@ void DrawPortSelector(AudioSettingsViewState& state, const char* probe_id, const
 
 void DrawAudioSettings(AudioSettingsViewState& state)
 {
-	ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Appearing);
-	ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+	// A modal in the shared frame like every other one (SF-80), rather than
+	// the floating window with its own shape this used to be. Opened here
+	// rather than by the caller because the caller has nothing else to say
+	// about it: `DrawAudioSettings` being called *is* the request.
+	if (!ImGui::IsPopupOpen(kTitle))
+	{
+		ImGui::OpenPopup(kTitle);
+	}
 
-	const ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
-		(state.first_run ? ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove : 0);
-
-	ImGui::Begin("Audio Settings", nullptr, flags);
+	if (!widgets::BeginModal(kTitle, kModalWidth))
+	{
+		return;
+	}
 
 	if (state.first_run)
 	{
@@ -251,6 +272,41 @@ void DrawAudioSettings(AudioSettingsViewState& state)
 	DrawPortSelector(state, "audio-output", "Output (sound out)", state.output_filter, state.jack_ports,
 		PortDirectionWanted::Playback);
 
+	// How wide the board's input is (SF-76). It sits with the input selector
+	// because it is a fact about the input, and it is the setting the
+	// splitter's stereo mode depends on -- with one channel there are no sides
+	// to send to two amps.
+	{
+		static const char* const kWidths[] = {"Mono (1 in)", "Stereo (2 in)"};
+
+		const int selected = state.board_inputs >= 2 ? 1 : 0;
+
+		ImGui::SetNextItemWidth(-1.0f);
+
+		if (ImGui::BeginCombo("Board input", kWidths[selected]))
+		{
+			for (int i = 0; i < 2; ++i)
+			{
+				if (ImGui::Selectable(kWidths[i], i == selected))
+				{
+					state.board_inputs = static_cast<unsigned>(i + 1);
+				}
+
+				RecordWidget(state, i == 0 ? "audio-inputs:mono" : "audio-inputs:stereo");
+			}
+
+			ImGui::EndCombo();
+		}
+
+		RecordWidget(state, "audio-inputs:combo");
+
+		if (ImGui::IsItemHovered())
+		{
+			ImGui::SetTooltip("How many channels the board takes in.\nStereo is what the splitter's \"Stereo input\" "
+							  "mode divides between the two channels.");
+		}
+	}
+
 	if (!state.server_running)
 	{
 		ImGui::Spacing();
@@ -267,6 +323,8 @@ void DrawAudioSettings(AudioSettingsViewState& state)
 		{
 			current_device_name = (*state.devices)[static_cast<size_t>(state.selected_device)].name.c_str();
 		}
+
+		ImGui::SetNextItemWidth(-1.0f);
 
 		if (ImGui::BeginCombo("Card", current_device_name))
 		{
@@ -308,6 +366,8 @@ void DrawAudioSettings(AudioSettingsViewState& state)
 		char rate_label[32];
 		std::snprintf(rate_label, sizeof(rate_label), "%.0f Hz", state.sample_rate);
 
+		ImGui::SetNextItemWidth(-1.0f);
+
 		if (ImGui::BeginCombo("Sample rate", rate_label))
 		{
 			for (double rate : kSampleRates)
@@ -335,6 +395,8 @@ void DrawAudioSettings(AudioSettingsViewState& state)
 
 	char buffer_label[64];
 	std::snprintf(buffer_label, sizeof(buffer_label), "%u samples", state.buffer_size);
+
+	ImGui::SetNextItemWidth(-1.0f);
 
 	if (ImGui::BeginCombo("Buffer size", buffer_label))
 	{
@@ -370,6 +432,17 @@ void DrawAudioSettings(AudioSettingsViewState& state)
 						  "server-wide setting: it changes for every JACK application, not just this one.");
 	}
 
+	// What the buffer size actually costs, in the unit the player cares about
+	// (SF-80). Two periods: one in, one out -- which is what "round trip"
+	// means and what the sidebar's Latency row reports from the server. Shown
+	// in mono because it is a number to compare against another number.
+	if (state.sample_rate > 0.0)
+	{
+		ScopedFont mono(Face::Mono, text::kXs);
+		ImGui::TextDisabled(
+			"%.1f ms round trip", 2000.0 * static_cast<double>(state.buffer_size) / state.sample_rate);
+	}
+
 	if (!state.status.empty())
 	{
 		ImGui::Spacing();
@@ -379,22 +452,34 @@ void DrawAudioSettings(AudioSettingsViewState& state)
 	ImGui::Spacing();
 	ImGui::Separator();
 
-	if (ImGui::Button(state.first_run ? "Start" : "Apply"))
+	// **The first run has no Cancel**: there is nothing yet to cancel back to,
+	// and a button that closed the only way of configuring audio would leave a
+	// board that cannot start.
+	if (!state.first_run)
+	{
+		if (widgets::SecondaryButton("Cancel") || widgets::ModalDismissed())
+		{
+			state.cancel_requested = true;
+			ImGui::CloseCurrentPopup();
+		}
+
+		RecordWidget(state, "audio:cancel");
+		ImGui::SameLine();
+	}
+
+	// Apply is the primary, right-aligned -- one loud button per modal, at the
+	// end of the row a reader finishes on.
+	const char* apply = state.first_run ? "Start" : "Apply";
+	ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - widgets::ButtonWidth(apply));
+
+	if (widgets::PrimaryButton(apply))
 	{
 		state.apply_requested = true;
 	}
 
-	if (!state.first_run)
-	{
-		ImGui::SameLine();
+	RecordWidget(state, "audio:apply");
 
-		if (ImGui::Button("Cancel"))
-		{
-			state.cancel_requested = true;
-		}
-	}
-
-	ImGui::End();
+	widgets::EndModal();
 }
 
 }  // namespace sf

@@ -256,6 +256,103 @@ void TestControlScaling()
 		"inverted range: 0 -> 1");
 }
 
+// The ten actions Milestone 10 added (SF-68). Each one is a target the
+// redesign put a learn button beside, and each has to survive the same
+// round-trip and the same refusals as the five that came before.
+void TestBoardWideActions()
+{
+	std::printf("\n-- board-wide actions (SF-68) --\n");
+
+	// Every new action, in one map, so a name that stopped parsing shows up
+	// here rather than as a mapping file that mysteriously won't load.
+	sf::MidiMap map = MapFrom(
+		R"([
+			{ "type": "cc", "number": 90, "action": "next_bank" },
+			{ "type": "cc", "number": 91, "action": "prev_bank" },
+			{ "type": "cc", "number": 92, "action": "toggle_metronome" },
+			{ "type": "cc", "number": 20, "action": "set_input_gain",  "min": -24.0, "max": 24.0 },
+			{ "type": "cc", "number": 21, "action": "set_output_gain", "min": -24.0, "max": 24.0 },
+			{ "type": "cc", "number": 22, "action": "set_tempo", "min": 40.0, "max": 240.0 },
+			{ "type": "cc", "number": 23, "action": "set_splitter", "port": "send_a",    "min": -60.0, "max": 6.0 },
+			{ "type": "cc", "number": 24, "action": "set_splitter", "port": "send_b",    "min": -60.0, "max": 6.0 },
+			{ "type": "cc", "number": 25, "action": "set_splitter", "port": "crossover", "min": 20.0, "max": 20000.0 },
+			{ "type": "cc", "number": 26, "action": "set_mixer", "port": "a", "min": -60.0, "max": 6.0 },
+			{ "type": "cc", "number": 27, "action": "set_mixer", "port": "b", "min": -60.0, "max": 6.0 }
+		])",
+		"board-wide map");
+
+	Check(map.Size() == 11, "every new action name parses");
+
+	Check(map.Bindings()[0].action == sf::MidiAction::NextBank, "next_bank parsed");
+	Check(map.Bindings()[1].action == sf::MidiAction::PrevBank, "prev_bank parsed");
+	Check(map.Bindings()[2].action == sf::MidiAction::ToggleMetronome, "toggle_metronome parsed");
+	Check(map.Bindings()[3].action == sf::MidiAction::SetInputGain, "set_input_gain parsed");
+	Check(map.Bindings()[4].action == sf::MidiAction::SetOutputGain, "set_output_gain parsed");
+	Check(map.Bindings()[5].action == sf::MidiAction::SetTempo, "set_tempo parsed");
+
+	Check(map.Bindings()[6].action == sf::MidiAction::SetSplitterControl && map.Bindings()[6].port == "send_a",
+		"set_splitter names its control through \"port\"");
+	Check(map.Bindings()[9].action == sf::MidiAction::SetMixerLevel && map.Bindings()[9].port == "a",
+		"set_mixer names its channel through \"port\"");
+
+	// Round-trip. The reason this matters for the new actions specifically is
+	// that each writes a different subset of the target fields, and a subset
+	// that doesn't match what the loader requires is a map that saves and
+	// then won't load.
+	sf::MidiMap reloaded;
+	std::string error;
+
+	Check(sf::MidiMap::FromJson(map.ToJson(), reloaded, error), "board-wide map reloads after serializing");
+	Check(reloaded.Bindings() == map.Bindings(), "round-trip preserves every board-wide binding");
+
+	// None of these lives in the chain, so none of them should imply a stage.
+	Check(!map.ToJson()[0].contains("stage") && !map.ToJson()[6].contains("stage"),
+		"board-wide actions do not emit a stage");
+
+	// The refusals. Each of these is a hand-editable mistake that would
+	// otherwise fail silently at stomp time.
+	ExpectRejected(R"([{ "type": "cc", "number": 1, "action": "set_splitter", "min": 0, "max": 1 }])",
+		"set_splitter without a port");
+	ExpectRejected(
+		R"([{ "type": "cc", "number": 1, "action": "set_splitter", "port": "wobble", "min": 0, "max": 1 }])",
+		"set_splitter with an unknown port");
+	ExpectRejected(R"([{ "type": "cc", "number": 1, "action": "set_mixer", "port": "c", "min": 0, "max": 1 }])",
+		"set_mixer with a channel that isn't a or b");
+	ExpectRejected(R"([{ "type": "cc", "number": 1, "action": "set_input_gain", "min": 1, "max": 1 }])",
+		"set_input_gain with an empty range");
+	ExpectRejected(R"([{ "type": "cc", "number": 1, "action": "set_tempo", "min": 120, "max": 120 }])",
+		"set_tempo with an empty range");
+
+	// A program change carries no value, so it cannot drive any of the
+	// continuous actions -- not just set_control, which was the only one that
+	// existed when that check was first written.
+	ExpectRejected(
+		R"([{ "type": "program_change", "number": 1, "action": "set_input_gain", "min": -24, "max": 24 }])",
+		"program_change cannot drive set_input_gain");
+	ExpectRejected(
+		R"([{ "type": "program_change", "number": 1, "action": "set_mixer", "port": "a", "min": -60, "max": 6 }])",
+		"program_change cannot drive set_mixer");
+
+	// ...but it is fine for the switch-like ones, which take no value at all.
+	sf::MidiMap stomps = MapFrom(
+		R"([{ "type": "program_change", "number": 5, "action": "next_bank" },
+		    { "type": "program_change", "number": 6, "action": "toggle_metronome" }])",
+		"program_change stomps");
+
+	Check(stomps.Size() == 2, "program_change still drives the actions that carry no value");
+
+	// Scaling, on one of the new continuous actions: the range in the file is
+	// the range the pedal sweeps.
+	sf::MidiActionInvocation invocation;
+
+	Check(Fires(map, Event(sf::MidiEventType::ControlChange, 0, 20, 0), invocation) &&
+			invocation.control_value == -24.0f,
+		"set_input_gain: 0 -> -24 dB");
+	Check(Fires(map, Event(sf::MidiEventType::ControlChange, 0, 20, 127), invocation) &&
+			invocation.control_value == 24.0f,
+		"set_input_gain: 127 -> +24 dB");
+}
+
 }  // namespace
 
 int main()
@@ -265,6 +362,7 @@ int main()
 	TestMatching();
 	TestSwitchEdges();
 	TestControlScaling();
+	TestBoardWideActions();
 
 	std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "ALL PASS" : "FAILED", g_failures);
 

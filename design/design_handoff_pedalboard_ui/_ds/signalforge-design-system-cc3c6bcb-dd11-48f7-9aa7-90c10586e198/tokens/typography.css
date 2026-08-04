@@ -1,0 +1,22 @@
+:root{
+--font-display:'Space Grotesk',system-ui,sans-serif;
+--font-ui:'Space Grotesk',system-ui,sans-serif;
+--font-mono:'IBM Plex Mono',ui-monospace,monospace;
+
+--text-2xs:11px;
+--text-xs:12px;
+--text-sm:13px;
+--text-base:14px;
+--text-md:16px;
+--text-lg:20px;
+--text-xl:26px;
+--text-2xl:34px;
+--text-3xl:46px;
+
+--leading-tight:1.15;
+--leading-normal:1.4;
+--leading-relaxed:1.6;
+
+--tracking-wide:0.04em;
+--tracking-wider:0.08em;
+}

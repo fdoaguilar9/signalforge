@@ -1334,15 +1334,1903 @@ through JACK, just a JACK the app can configure and launch itself.
   buffer size from the menu and confirm the latency figure moves and the
   sound survives it.
 
-## Milestone 9 — Binary split/merge (later)
+## Milestone 9 — Graph view, routing, and stereo
 
-- [ ] **SF-43**: Extend the chain data model from a flat list to the
-  `SeriesNode`/`SplitNode`/`MergeNode` tree described in PLAN.md §4.2,
-  without changing v1 behavior (still produces linear chains).
-- [ ] **SF-44**: Add exactly one split/merge pair to the UI (PLAN.md
-  explicitly scopes this to *binary* — no nested/multiple splits).
+Supersedes the two-line sketch this milestone used to hold (SF-43/SF-44,
+folded into SF-45 and SF-53 below). The ask grew: not just "one split
+somewhere in the list", but a **graph view of the signal chain** — the
+horizontal signal path from an AmpliTube-style board, where the chain is
+drawn left to right as tiles on a wire, a split fans the wire into two
+stacked lanes that rejoin at a mixer, and the two ends of the wire are the
+board's input and output.
+
+Two things this is explicitly **not**:
+
+- **Not drag and drop.** Nodes are placed by structure, not by the mouse.
+  Every edit is a button: `+` at an insertion point, `×` on a tile, "split
+  here", "rejoin". Layout is computed, never stored — there are no
+  coordinates in a preset file. This keeps the whole view a pure function
+  of the chain, which is what makes it testable and what keeps a preset
+  diffable.
+- **Not a free patch bay.** No arbitrary node-to-node cables, no cycles.
+  The topology is a tree: series of nodes, where a node may be a plugin or
+  a split into two branches that merge back. Everything drawable is
+  therefore also buildable and always has a defined signal order.
+
+The other half of the ask — "route the inputs/outputs" and "plug 2in/2out
+effects" — is really about **channels**, and it is the part with actual
+audio risk in it. Today `Chain` is mono end-to-end and refuses any
+channel-count mismatch between neighbours (`Chain.h`, SF-9). Stereo pedals,
+splits, and merges all break that assumption at once, so the engine work
+below lands *before* any of the drawing work.
+
+**PLAN.md needs amending alongside this** (§2 non-goals, §4.2, §5.1, §7
+channel adaptation) — that's SF-59, deliberately last, so it records what
+was actually built rather than what was hoped for.
+
+### Phase A — data model (no behavior change)
+
+- [x] **SF-45**: Chain graph node tree. `src/preset/ChainGraph.{h,cpp}`:
+  `Node` = one of `Plugin` (today's `PresetStage`), `Split` (exactly two
+  branches, each an ordered list of nodes, plus a merge description), where
+  a branch may itself contain a `Split` — recursion falls out of the shape
+  for free, and the UI, not the model, is what limits depth. Merge carries
+  per-branch gain in dB and a mute flag; the merge itself is a sum. Every
+  node gets a **stable id** (monotonic `uint32`, allocated on insert, never
+  reused within a preset) — indices shift on every edit and MIDI bindings,
+  the control panel, and the selection all need to survive that.
+  Plus `Flatten()` (graph → signal-ordered node list) and `FindById()`.
+  *Acceptance: unit tests build a nested graph, flatten it, and round-trip
+  ids through insert/remove.*
+
+  Landed as written, with **one change of mind that is worth stating,
+  because the plan said the opposite: an empty branch is legal.** It was to
+  be rejected at load. But an empty branch is a straight wire, and a dry
+  wire in parallel with a pedal is the main reason to reach for a split at
+  all — parallel compression and any wet/dry blend are exactly that shape.
+  Rejecting it would have forced a placeholder plugin into every dry path,
+  which is a worse model rather than a stricter one. A split with *both*
+  branches empty is also legal and is simply two wires; it's what you get
+  the moment you press "split" and before you put anything in either lane,
+  so refusing it would mean the editor couldn't build one.
+
+  `PresetStage` moved to its own header (`preset/PresetStage.h`) so that
+  `Preset` can hold a `ChainGraph` and `ChainGraph` can hold stages without
+  the two headers including each other.
+
+  The flat index — trunk in order, and at a split all of branch 0 then all
+  of branch 1 before the trunk resumes — is now the *definition* of a
+  "stage index", and `NodeAtFlatIndex`/`FlatIndexOf` are the only places
+  the index world and the identity world meet.
+- [x] **SF-46**: Preset JSON v2. Read: a top-level `"graph"` if present,
+  else today's flat `"chain"` array (which loads as a linear graph — every
+  existing preset in `presets/` keeps working untouched). Write: **flat
+  `"chain"` when the graph is linear**, `"graph"` only when it isn't, so a
+  linear preset's file doesn't churn just because the loader grew. Strict
+  errors as everywhere else (SF-31 style): a split with other than two
+  branches or a duplicate node id is rejected at load with the offending
+  path (an *empty* branch is legal — see SF-45). *Acceptance: every file in
+  `presets/` loads, saves, and is byte-identical; a hand-written split
+  preset round-trips.*
+
+  Byte-identity verified against all three files in `presets/` through
+  `--preset-roundtrip`. It needed one rule the plan hadn't thought of:
+  **the flat form writes an `id` per entry only once the ids stop being
+  positional.** A preset that has never been edited has ids 1..N in order,
+  which is exactly what the loader would assign anyway, so they are left
+  out and the file doesn't churn. The moment an insert or a delete shuffles
+  them they start being written — otherwise the node a selection or a
+  binding names would silently become a different pedal on the next load.
+
+  Both forms in one file is a load error rather than a precedence rule:
+  which one is the board would be a coin toss, and the two would drift
+  apart the first time either was hand-edited.
+- [x] **SF-47**: ~~MIDI bindings target node ids.~~ **Deliberately not
+  done — the plan was wrong to ask for it.** A binding lives in a *global*
+  mapping file that outlives any one preset: "CC 64 bypasses stage 1" means
+  stage 1 of whatever preset is loaded. Node ids are per-preset, so a
+  binding carrying one would mean nothing in every other preset in the
+  library. That's a regression dressed as a fix, and the acceptance
+  criterion it was written against ("a binding survives inserting a stage
+  ahead of its target") describes the wrong behaviour for a global map —
+  the player bound "bypass the second pedal", and it should stay that.
+
+  So the persisted meaning stays positional, `MidiMap` is untouched, and
+  the flat index keeps meaning what it always did. What the graph actually
+  needs — a stable handle for the UI's selection and for an edit in flight
+  — is served by node ids *in session only*, with `NodeAtFlatIndex` /
+  `FlatIndexOf` translating at the boundary. `apply_stage_edit` in
+  `main.cpp` is the first user: it takes the view's flat index, resolves it
+  to an id once, and edits by identity from there.
+
+  One pre-existing wrinkle this leaves standing, for SF-57 to deal with:
+  the flat index the UI and MIDI speak is a position in the *built chain*,
+  while `ChainBuildReport::skipped_indices` are positions in the *preset*.
+  They differ whenever a plugin is missing. That is already how it is; it
+  just gets easier to confuse once there are lanes.
+
+**Also done in Phase A, as fallout rather than as its own task:**
+`Preset::chain` no longer exists — `Preset::graph` replaced it, and every
+caller (`main.cpp`, `ChainPreset.cpp`, the console and CLI paths) now goes
+through `PluginCount()`/`PluginAt()`/`Flatten()`. For the duration of Phase A
+`BuildChainFromPreset` *refused* a preset containing a split rather than
+flattening it — `Chain` ran a series and nothing else, and a split played as
+a series is not a near miss but every parallel path stacked end to end. Phase
+B replaced that refusal with an engine that can actually run one; the
+translation from graph to `ChainSpec` now lives in the same function. Covered by
+`tests/ChainGraphTest.cpp` (`ctest -R chain_graph`, 69 checks); the
+signal-order assertions were checked against an injected regression
+(recursing into the two lanes in the wrong order), which they catch.
+
+### Phase B — engine (the part with audio risk)
+
+- [x] **SF-48**: Channel-aware links and implicit adapters. Replace
+  `Chain`'s equal-count requirement with a per-link channel count resolved
+  at build time: a link carries 1 or 2 channels, a stage declares what it
+  wants, and the builder inserts an adapter when they differ — mono→stereo
+  duplicates, stereo→mono sums at −6 dB (two correlated copies of the same
+  signal sum to +6, and duplicating then re-summing must be unity, not
+  double). Adapters are engine-internal; they never appear in a preset and
+  never appear as a tile. *Acceptance: a mono amp into a stereo chorus into
+  a mono cab builds and passes signal; a unit test asserts mono→stereo→mono
+  is unity gain, not +6 dB.*
+
+  Done, with the adapters living in a new **pure planner**
+  (`lv2/ChainSchedule.{h,cpp}`) rather than inside `Chain`. That split is the
+  main structural decision of Phase B and it is what made everything after it
+  testable: the planner takes a shape plus each stage's channel counts and
+  latency *as numbers*, and returns ops and buffers. It never touches lilv,
+  so what a split means is assertable with no plugins installed and no audio
+  server running.
+
+  Two refusals were added that the plan didn't ask for, both because the
+  alternative is a board that silently isn't what it claims. A plugin wider
+  than stereo on either side is refused *at the plugin*, not only where an
+  adapter happens to be needed — a three-output plugin last in the chain
+  would otherwise sail through and hand the board three outputs. A plugin
+  with no audio output at all is refused rather than leaving the signal with
+  nowhere to go. A plugin with no audio *inputs* is fine, and is treated as a
+  generator: it replaces the signal rather than processing it.
+- [x] **SF-49**: Split/merge execution. A split copies its input to both
+  branches; each branch runs into its own buffers; the merge sums them with
+  the per-branch gains. Buffers come from a **pool sized at build time**
+  with lifetime analysis (a branch's buffer is free again after the merge),
+  because one `vector` per link at depth is a lot of memory to touch per
+  block for no reason. *Acceptance: a split with one branch muted is
+  sample-identical to the other branch alone; both branches at 0 dB sum as
+  expected.*
+
+  **The buffer pool is simpler than planned, deliberately.** The plan called
+  for lifetime analysis so a lane's buffer could be reused after the merge.
+  What landed allocates one buffer per link, which is what `link_buffers_`
+  already did — for a board of a dozen pedals that is a few dozen blocks of
+  float, and the analysis would have bought memory nobody is short of at the
+  cost of the one part of this that has to be obviously correct. Worth
+  revisiting only if a board gets big enough to notice.
+
+  Both lanes are planned to read the *same* input buses, with no copy. That
+  is safe because an LV2 plugin never writes to its input buffers — it writes
+  to the fresh output buses allocated for it — so nothing lane 0 does can
+  disturb what lane 1 reads. If that assumption ever breaks, this is the line
+  it breaks at.
+
+  One consequence worth knowing before it surprises someone: **two dry wires
+  in parallel sum to twice the signal.** That is arithmetic rather than a bug
+  — two unity paths carrying the same samples add — but it means a split with
+  nothing in either lane is a +6 dB jump. Per-lane gain is where to fix it on
+  a given board; whether the *editor* should default a new split's lanes to
+  −6 dB is a Phase C question (SF-55).
+- [x] **SF-50**: Flattened RT schedule. The tree is compiled on the control
+  thread into a linear op list (`RunStage`, `Copy`, `MixInto`, `Adapt`)
+  that `Chain::Run` walks with no recursion, no allocation, no branching on
+  node type beyond a switch. This is what keeps a graph as RT-safe as
+  today's list. *Acceptance: existing engine tests still pass; a schedule
+  for a nested graph is asserted op-by-op in a unit test.*
+
+  `Chain::Run` is now a loop over a `std::vector<ChainOp>` and a switch on a
+  five-value enum. The tree is gone by the time the audio thread sees it.
+
+  The one piece of per-cycle work that isn't an op: a bus at the board's edge
+  is repointed when JACK hands out its buffer for that cycle, and any plugin
+  port sitting on that bus has to follow it. That list is precomputed at
+  build time, and nothing on the path allocates.
+- [x] **SF-51**: Latency compensation across a split. Two branches of
+  unequal latency comb-filter when summed, and it is the single most likely
+  "why does the split sound wrong" bug. Sum each branch's reported LV2
+  `latency` port, delay the shorter branch by the difference. Report the
+  per-branch figures so the UI can show them. *Acceptance: a split with a
+  deliberately latent plugin on one side sums without cancellation; the
+  compensation delay is asserted directly.*
+
+  `PortInfo` learned to spot a latency port — both spellings, since plugins
+  in the wild use both: `lv2:designation lv2:latency` and the older
+  `lv2:reportsLatency` property. `PluginStage::LatencySamples()` reads it, and
+  a negative, non-finite, or absent figure reads as zero rather than sizing a
+  delay line from garbage.
+
+  **What this does not do is follow a plugin that changes its latency while
+  running.** The alignment delay is fixed when the chain is compiled, because
+  re-planning mid-block is not something the audio thread can do; rebuilding
+  the chain picks up the new figure. Worth stating because a lookahead
+  limiter switching modes is a real case, not a hypothetical one.
+- [x] **SF-52**: Stereo board boundary and input/output routing. The board
+  itself becomes 1-or-2-in / 1-or-2-out; `JackEngine`'s existing
+  mono→stereo mirror at the output (SF-9) becomes the degenerate case
+  rather than the rule. Which hardware ports feed the input and which take
+  the output becomes explicit, persisted in settings, and settable at
+  runtime through the existing `ConnectAudioPorts`/`DisconnectAudioPorts`
+  path. *Acceptance: a stereo-out board reaches both speakers with no
+  mirror; changing the output device from the UI re-patches without a
+  restart.*
+
+  **Half of this turned out to be already built.** Choosing which physical
+  ports feed the board, persisting that choice, and re-patching at runtime
+  all landed in SF-39/40 — `AudioConfig::input_ports`/`output_ports`, the
+  Audio Settings view, and `JackEngine::ConnectAudioPorts`. Rather than
+  rebuild it, what was actually missing got added: **the board's width is now
+  a choice rather than a consequence.** `AudioConfig::board_inputs` is 0
+  (auto), 1, or 2; auto means "as many as the first pedal wants", which is
+  what this always did and is right for a guitar. Without it, the width of
+  the whole board is decided by whichever pedal happens to be first, which is
+  a strange way for a stereo rig to be configured.
+
+  The mono→stereo mirror at the output (SF-9) is now the degenerate case
+  rather than the rule: a board that is genuinely stereo out reaches both
+  speakers on its own. Nothing about the mirror needed changing — it was
+  already written as a condition rather than an assumption.
+
+**Phase B verification.** `chain_schedule_test` (43 checks) covers the
+planner and the arithmetic with nothing installed: both adapters and their
+levels, split ordering, lane gain and mute, alignment, the passthrough
+aliasing case, and every refusal. `split_routing` covers the whole path
+against a real LV2 plugin — a preset in the nested `graph` form, loaded from
+disk, translated, planned, instantiated, and run through the offline engine —
+and asserts that **a split with one lane muted is sample-for-sample identical
+to that lane on its own** (equal output hashes), that both lanes live is not,
+and that a dry lane in parallel is its own thing again.
+
+Both were checked against injected regressions — summing a downmix instead of
+halving it, and disabling lane alignment — and each is caught. The alignment
+injection also caught a flaw in the test itself: it indexed a vector it had
+only checked the size of on the line before, so a failure segfaulted instead
+of naming the broken assertion. Fixed.
+
+**Not covered, and it needs ears:** that a split *sounds* right through real
+speakers, and that the alignment delay removes the comb filtering rather than
+merely existing. The hashes prove the arithmetic is what was intended; only
+playing through it proves the intent was right. Same standing limitation as
+SF-28 through SF-30, SF-38 and SF-41.
+
+### Phase C — the view
+
+- [x] **SF-53**: Pure layout pass. `src/ui/GraphLayout.{h,cpp}`: graph →
+  `{node id, column, lane, rect}` plus the wire segments between them, with
+  no ImGui in the file at all. Column is signal position; a split occupies
+  the columns its longest branch needs and its two branches take the lanes
+  above and below the centre line. *Acceptance: layout of a nested graph is
+  asserted as data — this is the piece that would otherwise only ever be
+  checked by looking at it.*
+- [x] **SF-54**: Draw it, read-only. `GraphView` renders the layout with
+  `ImDrawList`: rounded tiles carrying the plugin name, wires as
+  colour-coded polylines (branch A / branch B / trunk, matching the
+  reference board's orange-and-blue reading), bypassed tiles dimmed with
+  the wire passing straight through them, the selected tile outlined.
+  Input and output endpoints drawn as the two ends of the wire.
+  *Acceptance: `ui_smoke` renders a linear and a split graph without
+  assertions firing.*
+- [x] **SF-55**: Edit affordances. `+` at every insertion point (opens the
+  existing plugin browser, inserts *there* rather than appending), `×` on
+  every tile, "split here" on any insertion point on the trunk, "rejoin" on
+  a split (which concatenates branch A then branch B into the trunk and
+  says so, rather than silently discarding B), and ‹ › to move a tile
+  within its lane or across into the sibling lane. One edit per frame, as
+  `StageEdit` already enforces, since each costs a rebuild. *Acceptance:
+  every edit is driven by name through the widget probes, not by
+  coordinates.*
+
+  One departure from the plan, for a reason worth keeping: **"split here"
+  lives inside the browser that a "+" opens, not as a second button on the
+  board.** A split goes exactly where a pedal goes, so it is offered where a
+  pedal is offered; two buttons in every gap would double the clutter of the
+  picture that is meant to be readable at a glance.
+
+  Moving (‹ ›) went to the selected pedal's panel rather than onto the tile,
+  for the same reason. Removing stayed on the tile — it is the edit most
+  often made, and a panel is a step too many for it. The tile's "x" and the
+  panel's are disabled together when only one pedal is left: two ways to do
+  the same thing that disagree about whether it is allowed would be worse
+  than either alone.
+
+  "Rejoin" concatenates lane 0 then lane 1 into the trunk, flattening any
+  nested split with them. No pedal is lost — a rejoin that kept one lane and
+  dropped the other would silently delete pedals, and the lane it dropped
+  would be a choice the user never made.
+
+  Moving *across* lanes is still not done, and is the one thing on the board
+  that still needs the file: a pedal in the wrong lane has to be removed and
+  re-added on the other one. It wants a gesture that isn't ‹ ›.
+- [x] **SF-56**: Routing UI on the endpoints. Clicking the input or output
+  endpoint opens a small popup listing the available JACK ports (from
+  SF-52) with mono/stereo choice. Per-branch gain/mute live on the merge
+  node's tile. *Acceptance: routing changes survive a restart; a muted
+  branch reads as muted on the wire, not just in a number.*
+
+  The plugs open the audio settings the program already had rather than a
+  second panel saying the same thing — there is one routing configuration,
+  and the board's edge is a way *into* it. Their tooltips say what is
+  currently patched, so the common case needs no click at all.
+
+  Per-lane gain sits on the wire next to its mute, because two unity lanes in
+  parallel are +6 dB and that is the control which makes a parallel blend
+  usable. **It reports on mouse release, not while dragging**: a lane gain is
+  compiled into the chain (SF-49), so every change costs a rebuild and a
+  crossfade, and firing per frame would rebuild the board sixty times a
+  second while the mouse moved. The number follows the cursor; the sound
+  catches up when it is let go. Making merge gains live — atomics the Mix op
+  reads, no rebuild at all — is the obvious follow-up if that lag grates.
+- [x] **SF-57**: Selection drives the existing panel. Clicking a tile
+  selects it; the control sliders, file picker, and MIDI-learn buttons that
+  `BoardView` already draws per stage now draw for the selected node,
+  keyed by node id. The old vertical stage list is **replaced**, not kept
+  alongside — two ways to edit the same chain is how they drift apart.
+  Console commands (`bypass <n>`, `status`) keep taking flattened indices.
+  *Acceptance: `ui_smoke` covers select → move a control → learn a binding
+  on a node inside a split branch.*
+
+  The vertical stage list is gone, and its per-stage expander went with it:
+  the panel shows the *selected* pedal, so "expand" and "collapse" stopped
+  being things. Clicking a tile twice deliberately does not deselect — a
+  selection that toggled would make the panel vanish under the second click
+  of a double one.
+
+  This needed a shape-preserving capture, and it is the part most likely to
+  be got wrong by someone changing this later. `CaptureChainPreset` can only
+  ever produce a *series*: a running `Chain` is a flat list of stages, and the
+  lanes it was built from are not recoverable from it. Editing a board means
+  keeping what the player changed by hand — knobs, bypasses, a loaded model —
+  without flattening their splits, so `CaptureChainPresetInto` takes the
+  source preset for the shape and the chain for the values. Saving goes
+  through it too, and did not before: **a board with a split, saved, would
+  have come back straightened out.**
+
+**Phase C verification.** `graph_layout_test` (34 checks) covers the geometry
+with no window: signal order with real gaps between tiles, lanes above and
+below the trunk, an empty lane that still offers somewhere to click,
+determinism, and no overlap at any nesting depth. Checked against an injected
+regression — placing both lanes on the trunk line — which it catches four
+ways.
+
+`ui_smoke` now drives the board itself: selecting a tile, the "x" on a tile,
+the "+" in a gap, the browser it opens and the split that can be inserted
+there instead, the plugs at both ends, and — on a board with an actual split
+— a lane mute, a rejoin, a "+" *inside* a lane carrying which lane it was,
+and selecting a pedal that lives in a lane and reading its controls there.
+
+Two things that test taught, both fixed rather than worked around: two
+widgets had ended up answering to the same probe name (`remove:` from a tile
+and from the panel), which makes a test click whichever it finds first; and a
+step that opens a popup reports positions from the frame it opened in, while
+Dear ImGui may still move that popup on its second frame, so aiming at where
+it *was* missed. There is a settling frame between steps now.
+
+**Not covered, and it needs eyes:** whether the picture is legible. Whether
+the lane colours read as lanes, whether a nested split is comprehensible or
+merely correct, whether the tiles are the right size on a real screen. Every
+claim above is about structure and behaviour; none of them is about whether
+it looks like a signal chain.
+
+### Phase D — closing out
+
+- [x] **SF-58**: Rebuild-on-edit through the existing crossfade path, and
+  the degraded-build story (SF-31) extended to graphs: a missing plugin
+  inside a branch drops that node, an entirely empty branch collapses the
+  split back to a series, and the warning line says which. *Acceptance: a
+  preset naming an uninstalled plugin inside a split still loads and
+  plays.*
+
+  The rebuild half was already done: every shape edit goes through
+  `switch_to_preset`, which is the crossfaded path a preset switch uses, for
+  the same reason -- the old chain keeps making sound while the new one is
+  built. And a missing plugin inside a branch already dropped that node, since
+  the translation walk is recursive and never cared which list it was in.
+
+  What was missing is the case that only splits have. **A lane that lost
+  everything it had is not the same as a lane that was authored empty**, and
+  the difference matters more than it looks: an authored empty lane is a dry
+  wire and the whole point of a wet/dry blend, while an emptied one would sum
+  a dry copy against the surviving lane at +6 dB -- a tone nobody saved, from
+  a board that looks like it loaded fine. So a split with an emptied lane
+  collapses to a series, which is the board minus the pedal that is gone; a
+  split with an authored empty lane is untouched.
+
+  `missing_plugin` covers both, and the exact claim is the strong one: a
+  collapsed split is sample-for-sample the surviving lane in series. An intact
+  split and a dry-lane split are each asserted to sound like neither, or that
+  check would pass in a build that collapsed every split it met. Collapsing
+  authored dry lanes too was the injected regression.
+- [x] **SF-59**: Update PLAN.md (§2 non-goals — the "no node editor / no
+  parallel routing / mono-only" lines are no longer true and should say
+  what replaced them, not just be deleted; §4.2; §5.1 format; §7 channel
+  adaptation) and README's "no drag-and-drop graph editor" framing, which
+  is still accurate about *drag and drop* and now wrong about *graph*.
+
+### Decisions worth making before Phase A
+
+These change the shape of the work, so they're better answered than
+discovered:
+
+1. **Nested splits: allowed or one level?** The model gets recursion for
+   free; the *layout* is where it costs, since lanes have to nest. Cheapest
+   honest answer: allow it in the model and cap the UI at one level of
+   nesting for now, with the cap in one named constant so lifting it later
+   is a one-line change plus a layout test.
+2. **Merge = sum only, or sum + parallel-blend?** Sum is what a real
+   rig does and is one line. A dry/wet blend across the split is the same
+   thing expressed as gains, so per-branch gain (SF-45) covers it without a
+   second concept.
+3. **Does a split branch get its own input, or only the split's?** Only the
+   split's, i.e. no side-chain inputs. Anything else stops being a tree.
+
+## Milestone 10 — Look and feel
+
+A high-fidelity design for the whole window now exists — `design/`, a
+clickable HTML prototype plus a token set. It is a *reference*, not code to
+port: the app is C++/Dear ImGui over SDL2, so the work is recreating those
+layouts with ImGui calls. `design/.../README.md` carries the exact metrics
+and copy and is the authority for every value; the token CSS under `_ds/` is
+the authority for every colour.
+
+What it covers: a board screen (banks, presets, MIDI learn, engine stats,
+levels, and a chain with an optional split into channels A and B), a Live
+performance screen, and seven modals — plugin UI, add stage, file picker,
+audio settings, MIDI mapping table, tuner, metronome.
+
+### The design was drawn against a board that no longer exists
+
+**This is the thing to know before reading any task below.** The prototype
+was built against `main` as pushed, which did not yet contain Milestone 9's
+Phase C — `GraphView`, `GraphLayout` and the whole wired canvas were
+uncommitted at the time. So the design models the chain area as the
+*vertical stage list SF-57 deliberately deleted*, and knows nothing about
+tiles on a wire, `+` slots, or nested splits.
+
+The decision is to **adopt the design**: the wired canvas is retired
+(SF-74) and the chain becomes a vertical list of stage cards with the split
+drawn as two lanes side by side. That costs real, working, tested code, and
+it is worth writing down what it costs so nobody re-derives it later:
+
+- **Nested splits become undrawable.** `ChainGraph` keeps them — the model
+  is not narrowed, only the editor is — but the board draws exactly one
+  split, at one place on the trunk. What happens to a preset it can't draw
+  is specified in SF-71, and it is *not* "draw part of it".
+- **Insertion loses its precision.** A `+` in every gap becomes an `Add
+  stage` at the end of each section, plus `^ v` to walk a card into place.
+  More clicks for the same result.
+- **`graph_layout_test` goes**, and with it the only assertions about where
+  anything lands. The vertical layout is ImGui's flow layout, which is not
+  ours to assert.
+
+Four smaller places where the design and the code contradict each other.
+All four are settled in favour of the design, but each is a thing someone
+will otherwise get backwards:
+
+1. **The bypass checkbox is inverted.** In the design **checked means
+   active**; today `ImGui::Checkbox("##bypass", &bypassed)` is bound
+   straight to `bypassed`, so checked means *off*. Getting this wrong is
+   silent and audible.
+2. **The meter's colours mean something else.** Today `kMeterWarnDb` /
+   `kMeterHotDb` colour the *whole bar* by the current level, at −6 and −1
+   dBFS. The design colours each *segment* by that segment's own position:
+   below −12 comfortable, −12…−6 warn, above −6 hot, and everything above
+   −3 clip-red while clipping. A meter that changes colour all at once is
+   the thing the segmented one exists to replace, so the constants change
+   meaning rather than surviving unchanged (SF-64).
+3. **Lane mute has no home.** The mixer card is two level sliders;
+   `GraphBranch::muted` is not drawn anywhere. The flag stays — presets
+   carry it and a muted lane must not silently come back on load — and gets
+   a place in SF-72 rather than being dropped.
+4. **`Quit` is gone from the board.** The design's status bar is Save,
+   dirty caption, status line. The button exists today so the shutdown path
+   has a second deliberate trigger to test against, so it moves rather than
+   disappears (SF-73).
+
+The audio-risk order from Milestone 9 applies again: the splitter's new
+modes and the stereo input boundary (Phase D) are engine work, and they
+land before the card that edits them is finished.
+
+### Phase A — foundation (nothing moves yet)
+
+- [x] **SF-60**: Theme. `src/ui/Theme.{h,cpp}`: the token set as named
+  `ImVec4` constants, and one `ApplyTheme(ImGuiStyle&)` that sets every
+  `ImGuiCol_`, the radii (3px controls / 5px cards / 8px modals via
+  `FrameRounding`, `ChildRounding`, `WindowRounding`/`PopupRounding`), 1px
+  borders, and item spacing off the 4/8/12/16/20/24 scale. Hover steps one
+  background level lighter, press one more, focus is a 2px amber ring with
+  a 2px gap. Called once from `AppWindow::Open`, replacing
+  `ImGui::StyleColorsDark()`.
+
+  The amber accent (`#e0a458`) is genuinely new and is the whole reason the
+  window will stop looking like a debug tool. The **semantic meter colours
+  are not new** and must not be re-derived from the token hex: the tokens
+  were read *out of* `DrawLevelMeter`, so `Theme` takes the existing
+  `ImVec4` literals and the CSS is the copy. Round-tripping them through
+  hex would move them by a hair for no reason and make the design file and
+  the code disagree about which is the source.
+
+  *Acceptance: `--test-ui` renders with no assertions; `grep` finds no
+  `PushStyleColor` outside `Theme.cpp` and the meter/warning cases that are
+  semantic rather than chrome.*
+
+  Landed as written. One colour was quietly two: the clipping status line was
+  `ImVec4(0.95, 0.35, 0.35, 1)` while the meter's clip segment was
+  `(0.90, 0.25, 0.25, 1)`, and the token set has only one `--meter-clip`.
+  They are one colour now. Nobody would have called the difference
+  deliberate, but it is the kind of thing that survives forever once two
+  call sites have their own literal.
+- [x] **SF-61**: Fonts. Vendor Space Grotesk (Regular, SemiBold) and IBM
+  Plex Mono (Regular) — both SIL OFL, licence text alongside — into
+  `resources/fonts/`, and load them into the ImGui atlas at the sizes the
+  design actually uses (11/12/13/14/16 for UI, 11/12/13 mono, plus the
+  display sizes 20/26/46/72/84 the Live screen and the tuner need). A
+  scoped `Fonts::Mono` push/pop, because *every* numeric or technical
+  readout is mono in this design and threading a font handle through each
+  call site by hand will be got wrong.
+
+  ImGui's bundled `stb_truetype` loads these directly — no `imgui_freetype`,
+  no new dependency, and the SDL renderer backend uploads the atlas as it
+  already does.
+
+  Two things that are not optional. **Resource lookup has to work from a
+  build tree, an install prefix and a `SIGNALFORGE_RESOURCE_DIR`
+  override**, or the fonts load on the developer's machine and nowhere
+  else. And **a missing font file is not fatal**: keep the bundled bitmap
+  font, say so once on stderr, and open the window. A Pi image with no
+  `resources/` must still boot the board.
+
+  DPI belongs here too: the design's metrics are 1× pixels, so the atlas is
+  built at the display scale rather than scaled after the fact, which is
+  what keeps 11px mono legible instead of blurred.
+
+  *Acceptance: the window renders with the design's type at 1× and at 2×;
+  deleting `resources/fonts/` degrades to the bundled font with a warning
+  rather than failing to start.*
+
+  **Three things this task was wrong about, all found by doing it.**
+
+  *One atlas entry per size is no longer a thing.* Dear ImGui 1.92 rasterizes
+  a face at whatever size `PushFont(font, size)` asks for. So this is three
+  faces, not eleven bakes, and `sf::text::` is a list of numbers rather than
+  a list of font handles. The whole "which sizes do we preload" question the
+  task spends a paragraph on does not exist.
+
+  *Space Grotesk has no SemiBold.* Upstream ships Light, Regular, Medium and
+  Bold statics plus a variable font that stb_truetype cannot instance, and
+  Google Fonts has no static 600 either. The design asks for weight 600
+  throughout. **Weight 600 is Medium (500) here.** Bold was the other
+  candidate and is too heavy at 84px, which is the size that settles it.
+
+  *The design's disclosure arrows do not exist in either typeface.* Neither
+  face carries U+25B8 `▸` or U+25BE `▾` — checked, not assumed — so a stage
+  card cannot set them as text, and the glyph range is Latin-1 plus U+2039
+  and U+203A for the header's breadcrumb and nothing more. **SF-70 has to
+  draw those arrows as triangles on the draw list**; `ImGui::ArrowButton`
+  already does exactly that, so this costs nothing as long as somebody knows
+  before they write `"▾"` and get a box.
+
+  The resource search is environment variable, then alongside the binary,
+  then the install prefix, then two build-tree shapes, then the source
+  directory compiled in by CMake — and the failure message lists every
+  directory it looked in, deduplicated, because "it works on the machine it
+  was built on" is the way this goes wrong.
+- [x] **SF-62**: The window frame. Three bands: header (52px, surface, 1px
+  bottom hairline, 16px padding), body, status bar. Header carries the
+  wordmark, a 1px×20px divider, the `bank › preset` breadcrumb (preset path
+  as its tooltip), a spacer, the segmented Board / Live pair, then ghost
+  buttons — MIDI map, Tuner, Metronome, Audio settings. Body splits into
+  the 330px sidebar and the content area, **each with its own vertical
+  scroll**, which is the structural change: today everything shares one
+  scrolling column, so expanding a stage pushes the meters off the bottom.
+
+  The menu bar goes. Its one item, Audio Settings, becomes the header's
+  ghost button, which is also where the retired canvas endpoints (SF-56)
+  sent people.
+
+  The MIDI-learn strip and the missing-plugin warning banner move between
+  the header and the body, both already driven by state that exists
+  (`learning`/`learning_what`, `warning`).
+
+  *Acceptance: `ui_smoke` reaches audio settings through the header button
+  rather than the menu; the sidebar scrolls with the chain area held still
+  and vice versa.*
+
+  **The window had to get much bigger, and that is a real consequence rather
+  than a preference.** A fixed 330px sidebar at the old 720×560 default left
+  the chain 390px — less room than the meters get. The default is 1280×800
+  now, and the self-test window went from 700×1100 to 1280×1100. That test
+  was the first thing to notice: at 700 wide, the `x` on a tile sits past the
+  right edge of the chain pane, so `ui_smoke` failed on a step that had
+  nothing to do with what changed. Worth knowing that this milestone has
+  raised the floor on how small the window can usefully be; whether 1280 is
+  the right floor for a 7" Pi panel is SF-84's problem.
+
+  **Hairlines are drawn as snapped rects, not as lines.** `AddLine` with
+  anti-aliasing on spreads a horizontal rule across two rows when its
+  coordinate isn't on a pixel centre, and because the spread depends on the
+  coordinate, the *same* rule came out 1px thick at one end and 2px at the
+  other. On a design that is almost entirely hairlines this reads as a
+  rendering fault. `AddRectFilled` on whole pixels cannot do it.
+
+  Three of the design's four header buttons are not here. MIDI map, Tuner and
+  Metronome arrive with the screens they open (SF-78, SF-81, SF-82) rather
+  than sitting in the header disabled — a header of dead controls is a worse
+  first impression than a header that is still filling up. Audio settings is
+  there, and is now the only way in, since the menu bar it used to live on is
+  gone.
+
+  **Also landed, and not in the plan: a frame-capture hook.**
+  `SIGNALFORGE_UI_CAPTURE=<path> SIGNALFORGE_UI_CAPTURE_FRAME=<n>` writes one
+  rendered frame to a BMP from `AppWindow::EndFrame`. It exists because this
+  entire milestone is judged by eye and `ui_smoke` cannot see: every
+  assertion it makes is about what was drawn, not what it looks like, and the
+  dummy video driver the tests run under has no window to photograph. It is
+  an environment variable rather than a CLI flag because it is a development
+  aid, not a feature. It found both problems above.
+
+  One thing it also showed, which is not solved: the self-test cannot run on
+  a real display. Its injected mouse positions fight the actual pointer, so
+  it fails at the first click under X11 and passes under the dummy driver.
+  Fine for now — capture works headless — but a `--test-ui` that only works
+  headless is worth knowing about before someone tries to demo it.
+
+### Phase B — the parts the screens are made of
+
+- [x] **SF-63**: Shared widgets. `src/ui/Widgets.{h,cpp}`: section label
+  (11px mono, `--text-disabled`, 0.08em tracking), rail (centred label
+  between two hairlines), segmented control (the Board|Live and 1ch|2ch
+  pair are the same thing twice), the three button weights (ghost,
+  secondary, primary), status banner in its two tones, list row
+  (label + sublabel + selected), and the modal frame — plain
+  `rgba(0,0,0,0.6)` scrim with **no blur**, 8px radius, Escape and Cancel
+  both close.
+
+  `DrawLearnButton` moves here out of `BoardView.cpp` unchanged: it is
+  already what the design asks for, down to being disabled while any learn
+  is armed, and it is now wanted by three screens.
+
+  Every one of these takes the probe recorder. The self-test drives widgets
+  by name, and a component that forgets to record is a component no test
+  can reach.
+
+  *Acceptance: each widget is exercised once by `ui_smoke` by name; the
+  modal frame's Escape path is covered for a modal that has no Cancel
+  button.*
+
+  `WidgetProbe` moved here out of `BoardView.h` and grew a `ProbeRecorder`
+  around it -- a nullable sink, so a widget records itself without asking
+  whether it is being tested and costs nothing when nobody is listening.
+  `AudioSettingsView.h` was already including `BoardView.h` for that one
+  struct; it no longer has to.
+
+  Letter-spacing is drawn a character at a time, which makes `TextTracked`
+  **ASCII only**. Every label that wants it is an uppercase word like
+  `SIGNAL PATH`, and a multi-byte code point would be split into meaningless
+  bytes -- so that limit is stated at the declaration rather than discovered
+  later.
+
+  The segmented control is drawn rather than assembled from buttons: the
+  design gives the group one rounded outline with square divisions inside it,
+  and ImGui rounds a button's four corners or none of them.
+- [x] **SF-64**: Meters, DAW style. Replaces `DrawLevelMeter`'s
+  `ImGui::ProgressBar`. An inset well (`--bg-inset`, hairline, 3px radius,
+  inset shadow, 2–3px padding), 28 equal segments with 2px gaps, each
+  coloured by **its own** dB position (see the contradiction list above), a
+  2px `--gray-200` peak-hold marker falling 1.2 dB per 450 ms, and the
+  reading right-aligned in mono (`-9.2 dB`, `--` for silence, red while
+  clipping). 14px tall on the board, 20px in Live, with the shared
+  `-60 -30 -18 -12 -6 0` scale row underneath.
+
+  Peak hold is view state and decays on the frame clock, not the audio
+  clock — the engine already reports a per-frame peak and has no business
+  knowing how long a marker should hang.
+
+  `MeterFraction` keeps its non-finite guards exactly as they are; they are
+  the reason silence and NaN don't produce a segment count outside the
+  array.
+
+  *Acceptance: a pure unit test (no window) asserts segment colouring at
+  each boundary, the clip case, and that peak-hold decays to the live level
+  after the expected number of frames.*
+
+  `meter_test`, 75 checks, and it compiles with only `src` on the include
+  path -- which is the real assertion that the pure half of `Meter.h` stayed
+  pure. `MeterFraction` moved there out of `BoardView.h`, guards intact.
+
+  **The peak fall is stored as a rate, not as the design's per-frame step.**
+  "1.2 dB per 450 ms frame" is a figure from a prototype that ticked at 450
+  ms; this program draws at 60 Hz, so kept as a per-frame step the marker
+  would fall fifteen times too fast. It is dB per *second*, and the test
+  asserts that sixty small steps land where one big one does.
+
+  A segment is coloured by the dB at **its own centre**. Some rule had to be
+  chosen and written down: -12, -6 and -3 fall on no segment boundary at any
+  segment count worth using.
+
+  One bug worth recording because it is the shape of mistake this layout
+  invites: the readings were positioned from `GetContentRegionAvail()` read
+  *after* the cursor had already moved along the row, so both meters drew
+  their dB figures off the end of the sidebar. Every position in a row like
+  this is now measured from one width captured before anything is drawn.
+- [x] **SF-65**: DSP load, measured and drawn. `JackEngine` times its own
+  process callback and publishes an exponentially-smoothed fraction of the
+  block's wall-clock budget through a relaxed atomic; the view reads it.
+  Nothing on the audio side allocates or locks — it is two clock reads and
+  a store.
+
+  Drawn as the same segmented well as the meter, labelled `DSP`, with a
+  percent readout: green below 60%, warn 60–80%, hot above. Tooltip
+  verbatim: `Share of each audio block's time budget spent running the
+  chain`.
+
+  This is the number that tells a player why they are getting xruns, and it
+  is the one piece of engine state in the design that has no source today.
+
+  *Acceptance: the figure is near zero with an empty chain and rises with a
+  real one; the callback's allocation-free property is checked the way the
+  existing headless path checks it.*
+
+  `jack_get_time` rather than `std::chrono`: it is documented as callable
+  from the process callback, it does not allocate, and it is what jackd
+  measures itself with -- so this figure and the server's agree about what a
+  microsecond is.
+
+  Smoothed **on the audio thread**, not in the view. The UI draws at 60 Hz
+  and the engine may run ten blocks between frames, so sampling the figure
+  per frame would miss exactly the spikes worth seeing. The coefficient is
+  per block rather than per second, which makes the smoothing longer in
+  wall-clock terms at a small buffer size -- correct, since that is also
+  where block times scatter worst.
+
+  **Not clamped to 100%.** Above 1.0 means the callback took longer than the
+  block it was given, which is an xrun about to happen; hiding that behind a
+  full bar would lose the one reading that explains the noise.
+- [x] **SF-66**: Global input and output gain. Two trims **outside** the
+  chain: one on the input buses before the first stage, one on the output
+  buses after the last. Deliberately not plugins — a plugin would be a
+  stage, would take a slot on the board, and would be saved into every
+  preset. Range −24…+24 dB, applied per block with a short ramp so a slider
+  drag doesn't zipper (the crossfade code's ramp is the right shape and is
+  already tested).
+
+  **They live in settings, not in presets.** The design puts them in the
+  sidebar's LEVELS group alongside the meters and lists them as app-level
+  state, which is right: they trim the interface, not the sound of a
+  patch. A per-preset output trim is a different feature and should not be
+  smuggled in through this one.
+
+  The output trim is also where SF-81's tuner mute lands, so there is one
+  place that can silence the board rather than two.
+
+  *Acceptance: ±24 dB is exactly ±24 dB through the offline engine; a
+  swept gain produces no discontinuity at block boundaries.*
+
+  **The input trim needs a scratch copy and the output trim does not.** A
+  JACK input port buffer belongs to the server and is ours to read, not to
+  write, so the input gain cannot be applied in place; the output buffers
+  are. That asymmetry is the only interesting thing in the implementation
+  and it is easy to get wrong in the quiet direction.
+
+  The ramp is linear across the block, not equal-power: this is one signal
+  being scaled, not two being crossfaded. Without it a trim steps the
+  waveform at every block boundary the value changes on, which at 128 frames
+  is a click 375 times a second while the mouse is moving.
+
+  **The input meter now reads *after* the trim**, reversing what the old
+  comment in `Process` said it was for. Pre-trim is defensible -- it says
+  whether the guitar is too hot regardless of what we do next -- but the
+  design puts the meter and the trim slider in one group, and a meter that
+  doesn't move as you drag the slider beside it is useless for the one job
+  it has there.
+
+  The output trim is applied before the mirrors copy and before the meter
+  reads, so a mirrored channel carries the same level as the one it mirrors
+  and the clip light describes what actually leaves the machine.
+
+  Moving a trim deliberately does **not** set `unsaved_changes`: these are
+  settings, and dirtying the preset because someone matched the output to
+  their interface would be wrong.
+
+  The arithmetic lives in `src/audio/Gain.h`, header-only and free of JACK,
+  so `gain_test` calls exactly what the engine calls rather than a copy that
+  can drift. 28 checks: the dB conversion at both ends of the slider and its
+  reciprocal symmetry, that unity *copies* rather than no-ops (the input trim
+  writes into a scratch buffer the chain then reads, so a skipped copy would
+  feed it last block's audio), and the continuity claim in full -- equal steps
+  inside a block, **the same step across the seam into the next one**, and a
+  sweep of the whole -24..+24 dB range block by block that never jumps by
+  more than one increment anywhere.
+
+  That seam is why a block ends at `to - step` rather than at `to`: ending
+  exactly on the target duplicates that value and leaves a flat spot at every
+  boundary, which is a buzz at the block rate while dragging.
+- [x] **SF-67**: Banks. A bank is a **subdirectory of the preset directory**
+  holding its own presets and, optionally, its own `manifest.json` for
+  order. The loose `*.json` directly in the preset directory are the
+  `Default` bank — so today's layout keeps working, unmoved and unedited,
+  and a second bank is a folder someone makes.
+
+  `PresetLibrary` grows a bank axis (or a `BankLibrary` over N of them).
+  Next/prev step within the current bank; `next bank` is its own action and
+  loads that bank's first preset, as the design specifies. CLI preset
+  resolution accepts `bank/preset` alongside every form it already takes,
+  and `Settings` remembers bank and preset together so resume still lands
+  where the player left off.
+
+  *Acceptance: `presets/` loads as one bank named Default in the same order
+  as today; a subdirectory appears as a second bank; the `resume_preset`
+  test is extended to a preset inside a non-default bank, including the
+  case where that bank has since been deleted.*
+
+  **`Count()` and `At()` still mean "the library", they just now mean the
+  current bank.** That is what kept this from being a rewrite of twenty call
+  sites in `main.cpp`: everything that predates banks already meant the bank
+  it was standing in. What changed shape is `Resolve`, which now returns a
+  `{bank, index}` and accepts `bank/preset`.
+
+  Verified by hand against a three-bank directory: Default first, then
+  subdirectories alphabetically, `mapping.json` still excluded. `Worship
+  set/w2-drive` resolves; a bare `w2-drive` resolves by falling through to
+  another bank; **`Covers/w2-drive` is refused rather than falling back** --
+  an explicitly named bank means that bank, or nothing.
+
+  Two rules that fell out of building it. An **empty folder is not a bank**:
+  somewhere to stomp into and find nothing is worse than not being able to
+  stomp there. And a **broken manifest costs its own bank, not the library**
+  -- the player loses a folder of sounds and is told which, where refusing to
+  start would lose them the gig.
+
+  `settings.last_preset` is now qualified (`bank/stem`) except in the Default
+  bank, which keeps it a bare stem -- so a settings file written before banks
+  still resolves to the same preset.
+
+  `resume_preset` now covers banks: that adding one doesn't change where the
+  board starts, that a qualified `bank/stem` resumes into it, that a bare stem
+  still finds a preset in another bank, that a **named bank which lacks the
+  preset is refused rather than falling back**, and that a remembered preset
+  whose whole *folder* has been deleted falls back like a missing file does --
+  which is what happens when someone tidies their presets between gigs.
+
+  Checked against an injected regression (the qualified form falling back to
+  any bank holding that name), which it catches. The first regression tried
+  did *not* fail the test, and that was worth finding out: the fallback search
+  uses the whole query including the slash, so it can never match a bare name
+  by accident. The refusal is doing real work, just not the work the first
+  guess assumed.
+- [x] **SF-68**: The MIDI vocabulary the design assumes. `MidiAction` gains
+  `NextBank`, `SetInputGain`, `SetOutputGain`, `SetSplitterControl` (send A,
+  send B, or crossover, depending on mode), `SetMixerLevel` (A or B),
+  `SetTempo` and `ToggleMetronome`; `LearnTarget` gains the matching
+  entries. `PrevBank` comes along for symmetry even though the design only
+  draws a `next bank` learn button — a next with no prev is a footswitch
+  layout nobody wants.
+
+  Persisted meaning stays positional, for exactly the reason SF-47 was
+  refused: the mapping file is global and outlives any one preset, so a
+  binding says "the mixer's channel A", not a node id.
+
+  Unknown actions in a hand-edited file keep failing loudly with the
+  offending entry named, SF-31 style.
+
+  *Acceptance: `midi_map_test` round-trips and rejects every new action;
+  `tests/data/example-mapping.json` grows one binding of each kind and
+  still loads through `--check-midi-map`.*
+
+  `SetSplitterControl` and `SetMixerLevel` name their target through the
+  existing `port` field ("send_a"/"send_b"/"crossover", and "a"/"b") rather
+  than a new lane field. That is exactly what `port` already means -- the
+  name of a control on a thing -- and the alternative was a field used by two
+  actions out of thirteen.
+
+  Two things generalised while passing through. The list of action names is
+  now built from the enum, so the "expected one of..." in a load error can no
+  longer go stale -- the hand-written list would have been wrong the moment
+  this grew. And the refusal of `program_change` for a continuous action now
+  covers **all six** value-carrying actions rather than only `set_control`,
+  which was the only one that existed when that check was written.
+
+  `NextBank` and `PrevBank` both exist although the design only draws a
+  `next bank` learn button: a next with no prev is a footswitch layout nobody
+  wants.
+
+  **Covering this found a real bug, which is the whole argument for having
+  done it.** `IsSwitchAction` was written as `action != SetControl`, so all
+  five of the new value-carrying actions were treated as switches: an
+  expression pedal on the output trim would fire only above the halfway point
+  and read every value below it as a release. The symptom -- a control that
+  simply stops responding over half its travel -- is one nobody would have
+  traced back to that line. It is now a switch over the whole enum, so adding
+  an action and forgetting to classify it is visible at the point of the
+  change.
+
+  `midi_map_test` gained a `TestBoardWideActions` covering every new name, the
+  round-trip (each action writes a different subset of the target fields, and
+  a subset that doesn't match what the loader requires is a map that saves and
+  then won't load), the refusals, and the scaling. `example-mapping.json` now
+  carries one binding of each kind and still loads through `--check-midi-map`
+  -- 15 bindings, all described correctly.
+
+### Phase C — the board screen
+
+- [x] **SF-69**: The sidebar. 330px fixed, own scroll, 16px padding, 1px
+  right hairline, 20px between groups, each group under an 11px mono label.
+
+  **BANK** — label, right-aligned `next bank` caption, learn button; the
+  select full width on the line below (it has a 260px minimum and must not
+  share a row). **PRESETS** — label plus `N of N`, a `Step:` row with next
+  and prev learn buttons, then the list in an inset well, one row per
+  preset carrying its name over a `<stem>.json` sublabel. Selection follows
+  **what is playing**, not what was clicked — the `requested_preset`
+  contract in `BoardView.h` is already written this way and stays.
+  **ENGINE** — the two-column table (sample rate, block size, latency as
+  `5.3 ms round trip`, MIDI bindings, controller) with the DSP gauge under
+  it. **LEVELS** — both meters, the shared scale row, the two gain sliders
+  with learn buttons, and the clipping line.
+
+  `Controller` is a new row: the name of the connected MIDI input, which
+  `JackEngine` knows and nothing currently shows.
+
+  *Acceptance: every group renders with an empty library, no MIDI device,
+  and no engine running — the sidebar is the first thing seen on a
+  half-configured machine and must not be a wall of blanks or crashes.*
+
+  `Controller` shows the JACK *client* name of the first connected MIDI
+  input, plus `+N` when there are several — an interface commonly presents
+  more than one port, and the row is 330px wide answering "is anything
+  plugged in", not "list my ports". Nothing connected reads `none` rather
+  than blank: a footswitch that does nothing is the most common thing to be
+  confused by, and an empty cell looks like a fault in the row rather than
+  an answer. It is read where the connection is made — the only place that
+  knows — and read again after an audio restart, since the ports are
+  registered afresh on the far side of one.
+- [x] **SF-70**: `StageCard`. `src/ui/StageCard.{h,cpp}` — surface fill,
+  hairline, 5px radius, panel shadow, 12px/16px padding. Header row: expand
+  arrow, bypass checkbox (**checked means active** — see the contradiction
+  list), plugin name (disabled colour when bypassed, URI as tooltip), the
+  **stage code right-aligned** in 12px mono (`0`, `1`, `A0`, `B1`), then
+  three 24px square `^ v x` buttons. `^` disabled on the first card of its
+  lane, `v` on the last, `x` when the chain would be left empty, tooltip
+  `A chain needs at least one stage`.
+
+  The code goes on the right next to the buttons, not as a `0. Name`
+  prefix. It is the number MIDI bindings and console commands speak, so it
+  needs to be readable, but it is not the card's title.
+
+  Expanded body, 24px indent: `Bypass` + learn, with a right-aligned
+  secondary `Open plugin UI` when the plugin declares one (SF-79); a row
+  per `atom:Path` property showing the file's basename or `(none) --
+  choose...` with the full path as tooltip; a row per control port, slider
+  or toggle by the port's own hints, non-writable ports as a disabled label
+  and value, and `This plugin has no controls.` when there are none. Most
+  of this is `DrawStagePaths`/`DrawStageControls` moved rather than
+  written.
+
+  **Expansion is keyed by node id, not by index.** The existing
+  `stage_expanded` vector-of-bool follows the wrong row after a move, and
+  its own comment admits it. With every card expandable at once instead of
+  one selected stage, that stops being cosmetic.
+
+  *Acceptance: `ui_smoke` expands a card, moves a control, and reads the
+  value back; bypass polarity is asserted explicitly, because it is
+  inverted from what the code does today.*
+
+  Asserting the polarity needed something the probes could not say. A
+  `WidgetProbe` carried a position and whether the widget was enabled, and
+  nothing about what it was *showing*; Dear ImGui does not keep a checkbox's
+  state anywhere a test can read it back afterwards. So a probe now also
+  carries `checked`, recorded by the card from the same `active` it draws
+  with. Without it the only assertable claim was "clicking it reports
+  ToggleBypass", which passes just as happily with the tick on the wrong
+  side — and the wrong side is where it was.
+- [x] **SF-71**: The chain area. Sections read off the graph — pre, then
+  CHANNEL A and CHANNEL B side by side in a 2-column grid of inset panels,
+  then post — separated by the `INPUT` / `SPLIT` / `MERGE` / `OUTPUT`
+  rails, with an `Add stage` ghost button ending each section. 24px
+  padding, 14px between blocks, own vertical scroll.
+
+  **A shape the board cannot draw says so instead of drawing it wrong.** A
+  preset with two splits on the trunk, or a split inside a branch, is
+  legal in the model and unreachable through this editor. It gets the
+  warning banner naming the shape and the chain area goes read-only. Half a
+  board drawn silently is worse than a board that admits it needs the file
+  — and this case is reachable today by hand-editing or by a preset written
+  before this milestone.
+
+  Insertion is section-append plus `^ v`. The `+` slots go with the canvas.
+
+  *Acceptance: a linear preset, a split preset, and an undrawable one each
+  render as described; every edit is driven by probe name, not
+  coordinates.*
+
+  Both undrawable shapes — two splits on the trunk, and a split inside a
+  channel — are self-test fixtures now. Each is asserted twice: once as
+  data, since `ReadShape` is pure and can be called with no window at all,
+  and once as a drawn frame. The data assertion checks the *reason* and not
+  just the refusal, because two different refusals that both said "cannot
+  draw this" would send someone to the wrong file.
+
+  The drawn assertion is the one worth keeping honest. It checks that the
+  banner is there, that **no** edit affordance is — `add-stage:*`,
+  `channels:*`, the mixer and splitter toggles, the mutes, and any stage card
+  at all — and that the sidebar's preset list survives, since switching away
+  is how someone gets *off* an undrawable board. The banner had to start
+  recording a probe to make the positive half of that assertable; without it
+  the only claim available was "the board is absent", which a crash also
+  satisfies.
+- [x] **SF-72**: The signal path control, and the splitter and mixer cards.
+
+  The `SIGNAL PATH` card sits above the `INPUT` rail: the mono label, a
+  segmented `1 channel` / `2 channels` pair styled exactly like Board|Live,
+  and the caption that changes with it. **This is the only control that
+  splits and un-splits.** `2 channels` inserts a split at the end of the
+  trunk with both lanes empty; `1 channel` collapses A → B → post into a
+  single series and reports `Collapsed to one channel -- every stage now
+  runs in series.` That is `RejoinSplit` in `main.cpp`, which already
+  exists and already refuses to discard a lane — a rename and a new caller,
+  not new behaviour.
+
+  Named "signal path" rather than "amp section", deliberately: the split is
+  not amp-specific.
+
+  **Splitter card** — 560px, centred, collapsible, its summary showing the
+  current setting when closed (`crossover at 800 Hz` / `full range into
+  both channels` / `Left input / Right input`). Mode select with all three
+  options; the two that need SF-75 are disabled with a tooltip until it
+  lands. Per-mode contents and captions verbatim from the design README.
+  Every select in this card stacks full width — a 260px minimum select
+  paired side by side overflows a 560px card.
+
+  **Mixer card** — same shape and same collapse behaviour, summary
+  `A 0.0 dB / B 0.0 dB`. `Level A` and `Level B`, −60…+6 dB, with learn
+  buttons, under the caption `channel levels into the merge`. These map
+  onto `GraphBranch::gain_db`, which already persists.
+
+  Two things to fix while here rather than reproduce. **Merge gain becomes
+  live** — an atomic the `Mix` op reads, no rebuild — which SF-56 already
+  named as the obvious follow-up; with the mixer now a front-and-centre
+  card rather than a number on a wire, a slider that only takes effect on
+  mouse-up is the wrong feel. And **`GraphBranch::muted` gets a home**: a
+  muted lane reads `muted` in the summary with its slider disabled, and the
+  toggle sits on the card. The flag has to stay reachable — presets carry
+  it, and a lane that silently un-muted on load would be a bug nobody could
+  see.
+
+  Collapse state is UI-only and does not dirty the preset.
+
+  *Acceptance: splitting and collapsing round-trip a preset's stages with
+  none lost in either direction; a mixer slider drag is audible while the
+  mouse is still down.*
+
+  **Live merge gain, and where the number now travels.** A `Mix` op used to
+  carry the two lane gains the planner baked into it, so changing one meant
+  replanning — which is to say a rebuild and a crossfade, sixty a second
+  while a mouse moved. The op now also carries a *merge index*, and the
+  chain keeps one atomic gain per lane per merge. `Chain::SetMergeGain`
+  writes it from the control thread; `Run` reads every merge once at the top
+  of the block, before any op looks at one, and each `Mix` sweeps between the
+  value it had and the value it has. Reading per block rather than per op is
+  what keeps the two channels of a stereo merge in step — advancing one
+  shared "current" as the ops went by would give the second channel a
+  different ramp from the first.
+
+  It sweeps rather than steps because stepping a summing gain at a block
+  boundary is a click, and a fader that clicks while it moves is not a fader
+  anyone can set by ear. `OpMixRamp` with `from == to` is `OpMix` exactly,
+  bit for bit — asserted, not assumed — so a board nobody is touching sounds
+  the way it did and `split_routing`'s hashes are unchanged.
+
+  **Merge numbering is a contract between two files.** The planner numbers
+  splits pre-order, a split before either of its branches;
+  `ChainGraph::MergeIndexOf` counts them the same way. They have to stay the
+  same walk, and if they ever drift a fader moves the wrong lane of the wrong
+  split — which looks like a UI bug for a week. Both sides assert the order
+  independently, including the case that separates them: post-order
+  numbering, which the *outer* split of a nested pair would get wrong.
+
+  **Mute deliberately did not become live.** It is one edit rather than a
+  stream of them, and going through the rebuild path is what gives it a
+  crossfade instead of stepping a lane to silence at a block boundary.
+
+  The learn buttons bind `SetMixerLevel`, which the MIDI layer already had a
+  name and a `port` field for and nothing drove. The binding names the
+  *lane* — "a" or "b" — not the split it was made on: a mapping file outlives
+  the preset it was written against, and a node id would mean a different
+  node in the next one. A pedal therefore moves the first split on the trunk,
+  which is the one the board draws.
+
+  **Not covered, and it needs ears** — the same standing limitation as the
+  split itself: that a lane fader *sounds* smooth under a fast drag. The
+  ramp's arithmetic is asserted, and the rebuild it replaced is gone from the
+  path, but only playing through it proves the sweep is inaudible.
+- [x] **SF-73**: The status bar. Surface fill, 1px top hairline, 8px/16px:
+  the primary `Save preset` (disabled until dirty, and the
+  `save_blocked_reason` tooltip on hover when blocked), the `unsaved
+  changes` caption, and the right-aligned status line.
+
+  `Quit` leaves the board. It exists so the shutdown path has a deliberate
+  trigger the self-test can pull, so it moves to a key binding rather than
+  being deleted — closing the window is the player's way out and the design
+  has no button for it.
+
+  *Acceptance: `ui_smoke` still ends through the deliberate quit path
+  rather than only through the frame-count timeout.*
+
+  The self-test now ends by pressing Ctrl-Q and asserting the board asked to
+  quit — and by drawing one more frame with nothing held and asserting it
+  did not, so the first check can't pass on a flag that was simply always
+  set. It also checks the chord asked for *nothing else*: a shortcut that
+  saved or edited the chain on its way out would be worse than no shortcut.
+
+  **What that reaches, and what it does not.** `--test-ui` drives the view
+  directly and never builds an engine, so there is no loop here to leave;
+  what is asserted is the *request*, the flag the main loop watches. That is
+  the half that would rot unnoticed — the other half is one `if` in
+  `main.cpp` that every ordinary run executes and every quit proves.
+- [x] **SF-74**: Retire the canvas, rework the self-test. Delete
+  `ui/GraphView.{h,cpp}`, `ui/GraphLayout.{h,cpp}`, `tests/GraphLayoutTest.cpp`
+  and the `graph_layout` test; `BoardGraphNode`, `BoardGraphBranch` and
+  `BoardSlot` move into `BoardView.h`, since they are the view's snapshot
+  of the shape and outlive the thing that drew it.
+
+  `UiSelfTest.cpp` is the real work: ~22 probe references point at canvas
+  widgets (`node:`, `slot:`, `mute:`, `rejoin:`, `gain:`, `endpoint:`) that
+  will not exist. Each becomes a card, section or card-button probe. The
+  endpoints were also the way into audio settings, which is now the
+  header's ghost button.
+
+  Two lessons from Phase C's own self-test work are worth not relearning:
+  no two widgets may answer to the same probe name, and a step that opens a
+  popup needs a settling frame before it aims at anything inside it.
+
+  *Acceptance: `ui_smoke` covers select → expand → move a control → learn a
+  binding on a stage inside CHANNEL B; `ctest` is green with `graph_layout`
+  gone rather than skipped.*
+
+  The split fixture's pedal moved from CHANNEL A to **CHANNEL B**, which is
+  the lane the acceptance names and the one that can actually go wrong. A
+  stage in lane A is the case that works by accident: everything in lane A
+  comes first in signal order, so its flat index is the one it would have had
+  on a linear board, and a card that ignored lanes entirely would still
+  address it correctly. Lane B has to be counted.
+
+  It keeps the index it had — lane A is empty, and flattening takes all of
+  lane A before lane B — so nothing downstream in the self-test had to be
+  renumbered. It is also the *muted* lane, so the card is drawn inside a lane
+  contributing nothing: a muted lane still runs, and its pedals keep their
+  controls and their bindings.
+
+  The chain there is now expand → move a control → learn a binding, all on
+  that card. One thing learned putting it there: **collapsing the card
+  afterwards is not free.** An expanded card is tall, the mixer sits below
+  the lanes, and putting one away moves everything under it through three
+  levels of auto-resizing child — more than the two settling frames every
+  other step needs. It stays expanded, as it did before there was anything to
+  learn on it.
+
+**Phase C verification.** `ctest` is green: 26 tests, 0 failures, one skip
+(`path_property`, which wants `-DSIGNALFORGE_TEST_MODEL=<path>` to a real
+model file and has always skipped without one). `graph_layout` is gone rather
+than skipped, which is the half of SF-74 that a green run proves.
+
+`chain_schedule_test` grew a merge-gain section: that a stereo split is one
+merge and not two, that the outer split of a nested pair is merge 0 though it
+sums last, that the plan's gain table and the ops it planted agree including a
+muted lane's zero, and that a flat `OpMixRamp` is `OpMix` bit for bit while a
+moving one starts where it was and ends one step short of the target.
+`chain_graph_test` asserts the same numbering from the other side, on a graph
+with a nested split and a later trunk split.
+
+`ui_smoke` now also covers bypass polarity as a fact about what is drawn
+rather than what a click reports; expanding a card in CHANNEL B, moving one of
+its controls and learning a binding on it; the channel level reporting
+`SetLaneGain` mid-press with a value in dB; a muted lane's level
+drawn-but-disabled; both lanes' learn buttons carrying the lane and the
+−60…+6 dB range; two boards this editor refuses to draw, each asserted as data
+and as a frame with every edit affordance absent; and Ctrl-Q asking to quit
+while an unpressed frame does not.
+
+`split_routing` reaches the rest. `--test-chain` grew `--lane-gain <a|b>=<dB>`,
+which sets a level on the built chain the way the mixer card does — after
+`Settle`, with no replan. Without a way in from the command line, the merge
+index, the dB conversion and the atomic the audio thread reads would only ever
+have been checked by reading them: `SetMergeGain` is called from a slider, and
+nothing headless can move a slider.
+
+Its claims are about which runs differ from which rather than about matching a
+planned reference, because the first block *sweeps* to a new level instead of
+stepping to it — a level set live and the same level planned into the file
+agree everywhere except that one block, by design. So: setting a lane to the
+level it already has must be hash-identical to leaving it alone (which pins
+the lane and the conversion — writing −12 dB into the 0 dB lane would be
+plainly audible); setting it to a different one must not be (which rules out a
+`SetMergeGain` that never reaches the audio thread); and pulling lane A down
+must not sound like pulling lane B down.
+
+Six injected regressions, each caught: numbering merges post-order (caught by
+the nested-split check, and only by that one — a single split is merge 0
+either way); a ramp that jumps to its target instead of sweeping (caught three
+ways); a learn button that reports lane A for both lanes; `SetMergeGain`
+ignoring its lane argument; a second split on the trunk quietly drawn instead
+of refused; and Ctrl-Q doing nothing.
+
+**Still only read, not run:** the five lines in `main.cpp` between the
+slider's `SetLaneGain` and `Chain::SetMergeGain`. Both ends are asserted — the
+view's report in `ui_smoke`, the engine's behaviour through real plugins in
+`split_routing` — and the numbering they agree on is asserted from both sides.
+Reaching the glue itself needs a GUI frame and a running engine in the same
+test, which nothing here has.
+
+**Not covered, and it needs ears:** whether the picture is legible, and
+whether a lane fader sounds smooth under a fast drag. Every claim above is
+about structure and arithmetic.
+
+### Phase D — splitter modes and stereo (the part with audio risk)
+
+- [x] **SF-75**: Splitter modes. A split node gains a `splitter` object:
+  `mode` (`full` | `crossover` | `stereo`), `send_a`/`send_b` in dB, `freq`
+  in Hz, and `src_a`/`src_b` (`left` | `right` | `sum`). **An absent
+  `splitter` reads as `full` with unity sends**, so every split preset
+  written before this round-trips byte-identical — the same rule SF-46
+  established for ids.
+
+  In the planner (`ChainSchedule`, which takes numbers and touches no
+  lilv): `full` is today's copy plus two gains. `crossover` is a
+  Linkwitz–Riley pair at the crossover frequency — 4th-order LR
+  specifically, because its two halves sum flat and a Butterworth pair does
+  not, and a crossover that colours the sum is a crossover that will get
+  blamed on the amps. Below feeds A, above feeds B. Filter state lives in
+  the op, not in a plugin. `stereo` takes one side of a two-channel input
+  bus into each lane.
+
+  *Acceptance: `chain_schedule_test` asserts the LR pair sums flat across
+  the band within tolerance, that lane gains are applied where claimed, and
+  that stereo mode against a one-channel input is identical to full range;
+  a `split_routing`-style live test covers a crossover preset end to end.*
+
+  **Sends live on the splitter, returns on the branch.** The file groups
+  `send_a`/`send_b` with the mode and the frequency, as the plan above says,
+  which reads oddly next to the per-branch `gain_db` until you say what each
+  one is: a send is how hard the lane is *driven*, a return is how much of the
+  result comes back. With a distorting pedal between them those are not the
+  same knob, and the whole point of having both is to be able to hit an amp
+  hard and then bring it down. The planner wants the send where the lane it
+  feeds is, so `ChainPreset` moves it onto the branch on the way through --
+  one more thing that translation exists to do.
+
+  **A default splitter costs nothing, in every layer.** Full range with unity
+  sends plans no op and allocates no bus, so a preset written before this
+  compiles to exactly the plan it used to; the JSON writer omits a splitter
+  equal to the default, so such a preset also *saves* byte-identical; and
+  every field is written only if it differs, so a board that picked a
+  crossover frequency doesn't acquire two stereo sources nobody chose. All
+  three are asserted, the last two on the file and the first on the plan.
+
+  **Nothing here is live.** The mode, the frequency, the sources and the sends
+  are all planned into the chain, so each costs a rebuild -- unlike a merge
+  gain (SF-72) there is no atomic that could avoid it, because the filter
+  coefficients are built when the chain is. So the selects report on click and
+  the sliders report on release, the rule SF-56 established. That turned out
+  to need more than `IsItemDeactivatedAfterEdit`: **Dear ImGui writes a
+  dragged value into the caller's variable while the item is active and writes
+  nothing on the frame it is released**, so a control that read its value back
+  on deactivation reported the value the drag *started* from. The mid-drag
+  value is kept in `BoardViewUi` now, which also makes the number follow the
+  cursor while the sound waits -- the behaviour that was wanted anyway.
+
+  **Filter state is per channel as well as per half.** A stereo crossover is
+  four filters, not two: the state belongs to one channel, and one filter
+  shared between two would fold each into the other. The planner emits one per
+  channel and the test asserts the count, because this is invisible until it
+  is audible and by then it sounds like a bad plugin.
+
+  The crossover frequency is clamped at the filter rather than refused --
+  it comes from a slider and a silent board is a worse answer than one that
+  runs out of band -- but refused at the *parser*, where a `freq` of 0 is a
+  mistake in a file that should be reported once rather than silently
+  rewritten on every load.
+- [x] **SF-76**: Stereo in at the board boundary. `AudioConfig::board_inputs`
+  (0 auto / 1 / 2) landed with SF-52; what is missing is the Audio settings
+  row that sets it (`Mono (1 in)` / `Stereo (2 in)`) and the engine
+  actually opening two capture ports and carrying both into the board's
+  input bus.
+
+  This is what makes the splitter's `stereo` mode mean anything. When the
+  interface is providing one input channel, the mode still selects and the
+  splitter card shows the caveat the design specifies — both channels get
+  the same signal until a stereo input is chosen in Audio settings. Saying
+  that is better than disabling a control for a reason the player has to
+  guess.
+
+  *Acceptance: a stereo-input board with the splitter in stereo mode puts
+  left into A and right into B, asserted offline; a one-input board shows
+  the caveat and stays audible.*
+
+  The engine needed less than expected and the offline harness needed more.
+  `JackEngine::Start` already registers one JACK port per chain input port and
+  `ConnectAudioPorts` already matches them against capture ports by position,
+  so a chain planned for two inputs has always opened two. What was missing
+  was a way to *ask* for one: the dialog's `Board input` row, and a rebuild
+  when it changes. `restart_audio_engine` only replanned on a sample-rate
+  change; a width change has the same consequence for a different reason -- it
+  is planned into the chain, and the engine registers ports from the chain --
+  so a board that went mono to stereo would have come back up with the port
+  count it had before.
+
+  **The offline engine could not have caught any of this.** Its generator was
+  `f(frame)` and fed every input channel the same sample, so left into A and
+  right into B was indistinguishable from the reverse, from both, and from
+  neither. It takes `f(frame, channel)` now, and `MakeSineSweep` puts channel
+  0 at full level and everything right of it 12 dB down. Quieter rather than
+  silent, so a lane fed from the right is still a lane making sound: "it went
+  quiet" and "it was routed wrong" should not look the same. Channel 0 is
+  untouched, so every mono measurement ever taken with it still holds -- which
+  is why no existing hash moved.
+
+  `--test-chain` gained `--board-inputs 1|2` to reach it, alongside the
+  `--lane-gain` added for SF-72. Both exist for the same reason: these are
+  paths whose only other entrance is a control nothing headless can operate.
+
+**Phase D verification.** `ctest` is green: 26 tests, 0 failures, one skip
+(`path_property`, which still wants `-DSIGNALFORGE_TEST_MODEL=<path>`).
+
+The crossover is checked as a filter before it is checked as a feature.
+`chain_schedule_test` measures its response at six frequencies from 40 Hz to
+15 kHz and asserts the two halves sum to unity within 2% — they come out
+within 1e-5 — and that each half is **−6 dB** at the crossover rather than
+−3. That second one is what tells a Linkwitz-Riley from the Butterworth pair
+it is built out of, and it is the check that would catch someone "simplifying"
+the cascade back to one section. RMS rather than peak, deliberately: at 8 kHz
+on a 48 kHz board a sine is six samples per cycle and no sample need land near
+the crest, so peak under-reads by up to 13% for reasons that have nothing to
+do with the filter.
+
+Then the plan: that a default splitter emits no ops at all, that a send is one
+gain op on one lane, that send-down-and-return-up is unity end to end while
+what sat between them saw half, that a stereo crossover is four filters and a
+mono one is two, that low feeds A and high feeds B, that a stereo split takes
+its sides without copying them, and that stereo mode with one input channel
+plans *exactly* full range — op for op, not "sounds about the same".
+
+`chain_graph_test` covers the file: an absent splitter reads as full range and
+is written back absent, a splitter that spells out the defaults equals an
+absent one and saves as nothing, every field round-trips, only what differs is
+written, and six malformed splitters are refused with the JSON path named. A
+misspelt mode is refused rather than read as full range — the difference
+between two amps and one is not something to guess at.
+
+`ui_smoke` drives the card: per-mode contents (full range draws no frequency
+and no sources; crossover draws a frequency and no sources; stereo the
+reverse), the mode select opened and a mode chosen from it, the frequency and
+send sliders reporting on release, **and that moving one control leaves the
+rest of the splitter alone** — the check that catches a control which rebuilds
+the splitter instead of amending it. Plus the Audio settings `Board input`
+row, which must change the width and not the port filter beside it.
+
+`split_routing` covers the whole path with real plugins: an absent splitter and
+a spelled-out default one are the same sound sample for sample; stereo mode on
+a one-input board is full range, sample for sample; a crossover is not a copy;
+800 Hz and 250 Hz are different boards; a send changes what comes out; and on a
+two-input board, left-into-A, right-into-A and sum-into-both are three
+different sounds.
+
+Four injected regressions, each caught: one Butterworth section instead of the
+LR4 cascade (caught by both the flatness and the −6 dB checks, and by nothing
+else — the pass/stop checks are happy either way); a JSON writer that always
+emits the splitter (caught as a round-trip failure *and* as a compatibility
+one); a stereo split that ignores its sources and always takes the left; and
+an Audio settings row that always answers mono.
+
+Writing that third one turned up something worth keeping: with the stereo
+fixture's second lane at a plugin gain of `0.0` — a *linear* multiplier, so
+silence — every routing through it sounded identical and three of the
+assertions were passing on a silent lane. Both lanes carry real gain now.
+
+**Not covered, and it needs ears:** whether a crossover at 800 Hz is a
+musically useful place to split a guitar into two amps, and whether the LR4's
+phase behaviour is audible on a real cabinet. The arithmetic says the two
+halves sum flat; only playing through it says the split is worth having.
+
+### Phase E — the other screens
+
+- [x] **SF-77**: Live. Same header and status bar, body centred with
+  48px/32px padding and 28px gaps: bank name uppercase in mono, preset name
+  at 84px, `Next: <preset>` in mono, a 3-column grid of 104px preset tiles
+  (active tile raised, 2px amber border, amber name, panel shadow; each
+  tile shows its binding or `unbound`), full-width 64px `Prev` and `Next`,
+  then the 20px meters with their scale row.
+
+  This is the screen that gets looked at from two metres away with a guitar
+  on, which is the whole argument for the type sizes.
+
+  *Acceptance: `ui_smoke` switches to Live, loads a preset from a tile, and
+  returns to the board with the same preset playing.*
+
+  **Live replaces the body, not the window.** The header, the learn strip and
+  the status bar are drawn on both screens, because what they say is true on
+  both. What that buys is asserted rather than assumed: with Live up, none of
+  the board's widgets exist at all, so there is nothing underneath for a click
+  to reach.
+
+  Every way of changing preset here goes through `requested_preset` -- the
+  tiles, and Prev/Next -- which is the same field the sidebar's list uses.
+  Stepping *is* a preset switch, and a second channel to the caller would be a
+  second thing that could disagree about what is playing.
+
+  One ImGui trap worth writing down: **a child window is not an item.** The
+  tile was a bordered child with `IsItemClicked` after it, which is silently
+  never true -- a child captures the mouse on its own behalf. The tile's target
+  is an invisible button covering it, drawn first and written over, which is
+  the ordinary way to make an area of ImGui clickable and gives the probe a
+  real rect to aim at.
+- [x] **SF-78**: MIDI mappings modal. 680px, a 4-column table
+  (110/130/1fr/90) with a sticky `MESSAGE ACTION TARGET RANGE` header, one
+  row per binding — message in amber mono, action in secondary mono, target
+  in body text, range in disabled mono with `--` where the action takes no
+  value — and `N bindings` in the footer. Read-only, and **derived from the
+  live `MidiMap` rather than stored**: presets, next/prev, bank, every
+  stage bypass and control port, mixer, splitter, global gains and
+  metronome all render from the same table the engine resolves against.
+  Empty reads `No bindings yet -- press learn next to anything bindable.`
+
+  *Acceptance: a binding made through learn appears in the table without a
+  reload; the table's row count agrees with the sidebar's `MIDI bindings`
+  figure.*
+
+  Both halves of that acceptance are answered by *construction* rather than by
+  a check that could pass while being wrong. The rows are built in
+  `refresh_bindings`, which already ran whenever the map changed and is the
+  only place they are built -- there is no stored copy to fall behind, so a
+  binding just learned is in the table by the time the next frame draws. And
+  the sidebar's figure is now taken from the rendered rows rather than from
+  `MidiMap::Size()`: a row the table declined to render is a binding the
+  sidebar must not claim, and two counts of one list that could disagree
+  eventually will.
+
+  The row count is still asserted in `ui_smoke` -- construction settles what
+  the *caller* hands over, not whether the table draws all of it.
+- [x] **SF-79**: Plugin UI modal. 640px: a 200px inset well reading `The
+  plugin's own editor (suil embed) renders here.` over the plugin URI in
+  mono, then a `GENERIC CONTROLS` label over the same path and control rows
+  the stage card draws. Opened by the card's `Open plugin UI` button, which
+  only appears when the plugin actually declares a UI — lilv can say.
+
+  **The well is honest placeholder, not a promise.** Embedding a plugin's
+  own editor through `suil` is a v1 non-goal (PLAN.md §2) and stays one;
+  the generic controls are the fallback and have to keep working whether or
+  not that ever changes.
+
+  *Acceptance: opening the modal from a card shows that stage's controls,
+  and moving one is audible on the running plugin.*
+
+  The modal shows the card's rows, not a second set: `DrawStagePaths` and
+  `DrawStageControls` moved out of `StageCard`'s anonymous namespace and both
+  callers use them. So a knob moved in the modal reports through the fields
+  the card already reports through, and reaches the running plugin by the path
+  that already works -- two implementations would be two chances for one of
+  them to stop.
+
+  That immediately hit the rule Phase C wrote down: **no two widgets may
+  answer to the same probe name.** With the card expanded behind the modal,
+  both sets of rows were called `control:1:gain`, a test clicked whichever it
+  found first, and that was the one under a modal that nobody can reach. The
+  row drawers take a probe prefix now; the card passes none and the modal
+  passes its own.
+
+  Removing the duplication turned up more of it: `BoardView.cpp` still carried
+  its own `DrawStagePaths`/`DrawStageControls` from before cards existed,
+  called from nowhere since SF-70. Deleted.
+
+  `PluginStage::HasCustomUi` asks lilv rather than guessing, and the button is
+  drawn only for plugins that have an editor to talk about -- most have none,
+  and a button on every card that opened a modal saying "this plugin has no
+  editor" would be clutter serving the few that do.
+- [x] **SF-80**: Audio settings as a modal. Today it is its own floating
+  window with its own shape; it becomes a 520px modal in the shared frame
+  like every other one. Device select with the `unavailable` status banner
+  when the saved device is absent, then Input channels (SF-76), Sample rate
+  and Buffer size — each stacked full width, one per row, for the same
+  260px-minimum reason as the splitter card — a mono latency readout, then
+  Cancel / Apply.
+
+  The first-run path keeps its behaviour: no Cancel, because there is
+  nothing yet to cancel back to.
+
+  *Acceptance: both entry points (first run and the header button) render
+  correctly; applying still re-patches without a restart.*
+
+  The two entry points were already one function called from two places, so
+  what changed is the shape rather than the paths: `ImGui::Begin` became
+  `widgets::BeginModal`, and the popup is opened by the drawing code itself --
+  the caller has nothing else to say about it, and `DrawAudioSettings` being
+  called *is* the request. Applying is untouched, so the SF-38 re-patch still
+  happens without a restart.
+
+  Every select stacks full width for the same 260px-minimum reason the
+  splitter card has, and the buffer size gained the round-trip figure the
+  design asks for: two periods, one in and one out, which is what the
+  sidebar's Latency row means by the same words.
+- [x] **SF-81**: Tuner. 440px modal: `OUTPUT IS MUTED WHILE THE TUNER IS
+  OPEN`, the note at 72px, the frequency in mono, a 40px needle track with
+  centre and ±25-cent ticks, the `-50 -25 0 +25 +50` scale, and the cents
+  readout — green within ±5 cents, amber outside.
+
+  Pitch detection runs on the **control thread** over a copy of the input
+  buffer, not on the audio thread: autocorrelation or YIN over a window
+  long enough for a low E, which is far too much work per block to do
+  inline. The mute is the output trim from SF-66, so there is one thing
+  that can silence the board rather than a second path that can disagree
+  with it.
+
+  *Acceptance: fed a synthetic 440 Hz sine offline it reads A4 at 0 cents,
+  and a ±20-cent detune reads back within a cent or two — the claim is
+  testable, so it should be tested rather than eyeballed against a guitar.*
+
+  It reads 440.0 Hz and 0.0002 cents, and the detunes come back within 0.003
+  of where they were put. Two decisions bought that, and both are load-bearing:
+
+  **YIN's cumulative-mean normalisation, not plain autocorrelation.** A
+  periodic signal is just as unlike itself at twice its period, so the deepest
+  minimum is very often the octave *below* the note — and on a plucked string
+  where the second harmonic is louder than the fundamental, that is the common
+  case rather than the corner one. The normalisation makes the first deep
+  minimum win instead of the deepest. All six open guitar strings and a bass
+  low E are asserted as plucked tones with the fundamental deliberately quieter
+  than its own second harmonic, which is the shape that breaks the naive
+  version.
+
+  **Sub-sample interpolation of the minimum.** At 48 kHz, A4 is 109.09 samples
+  per period and the whole-sample lags either side are +1.4 and −14.4 cents. A
+  detector that rounded to a sample could not express "20 cents flat" at all —
+  it would put a perfectly tuned string 14 cents out and the display would be
+  reporting its own arithmetic. Removing the interpolation was one of the
+  injected regressions; it fails with exactly those two numbers.
+
+  **The window crosses threads as a whole buffer, not a ring.** Two buffers
+  with a handover flag: the audio thread fills one while the control thread
+  reads the other, and filling stops until the reader takes it. A ring the
+  reader chased could be overwritten mid-window, and half of one window
+  followed by half of the next is not noise — it is *periodic-looking*, and
+  would read as a confident wrong note.
+
+  The mute is the SF-66 output trim, at −90 dB rather than −INFINITY, because
+  that trim ramps across a block and there is no ramping toward negative
+  infinity. What it was before is remembered and restored: a tuner that left
+  the board at 0 dB would have quietly changed a setting the player chose.
+- [x] **SF-82**: Metronome. 460px modal: beat indicator (one 14px dot per
+  beat, active dot amber) beside the BPM readout; Tempo 40–240 with learn;
+  Time signature select (4/4, 3/4, 6/8, 2/4); Level 0–100%; Start/Stop
+  primary, Tap tempo secondary, and a learn button for start/stop.
+
+  The click is a source mixed into the output **after** the chain and after
+  the output trim, so the board's gain staging doesn't change how loud it
+  is and it can't feed the tuner. Beats are scheduled from a sample counter
+  on the audio thread — no timers, no allocation, no wall clock. Tap tempo
+  averages the last few taps on the control thread and writes one number
+  across.
+
+  *Acceptance: at 120 BPM and 48 kHz the click lands every 24000 frames,
+  asserted offline; the process callback still allocates nothing.*
+
+  Every gap is exactly 24000 frames -- not on average, not within a
+  millisecond. **The beat boundary is checked per sample, not per block**,
+  which is the difference between a metronome and a suggestion: quantising to
+  a 256-sample buffer is 5 ms of jitter, audible as sloppiness against anything
+  played to it. That was an injected regression too, and it reads 24064.
+
+  The block size is asserted not to move the beat at 13, 64, 512 and 1024
+  frames -- 13 especially, because a period that is not a multiple of the
+  block is the case a boundary check gets away with at 256.
+
+  The click mixes in **after the chain and after the output trim**, so the
+  board's gain staging cannot change how loud it is and it can never reach the
+  tuner, which listens to the input. `Metronome` is a control-thread object the
+  engine is handed a pointer to; jack/ has no business owning one, and its job
+  is only to give the click somewhere to land.
+
+  `SetTempo` and `ToggleMetronome` were bound and persisted since SF-21 with
+  nothing behind them. They drive something now -- both are plain setters on
+  atomics the audio thread reads, so a pedal can send as fast as it likes.
+
+**Phase E verification.** `ctest` is green: 28 tests, 0 failures, one skip
+(`path_property`).
+
+**One collision found after the fact, by a check that did not exist yet.**
+Every `Add stage` button is labelled "Add stage", and Dear ImGui identifies a
+widget by its label and the id stack above it -- so on a *split* board, the two
+on the trunk shared one id. A linear board draws one and never notices, which
+is why it survived every phase up to here.
+
+**How bad it actually was: not very, and it is worth being accurate about.**
+Hover and press resolve per *rectangle*, not per id, and ImGui's "is another
+item already hovered" guard passes precisely because the two share an id. Both
+buttons worked. Keyboard nav is not enabled here and neither button has a
+tooltip, so the entire visible symptom was ImGui's own debug tooltip in front
+of a developer hovering one of the pair. What a duplicate id genuinely breaks
+is id-*keyed* state -- popups, a slider mid-drag, tree nodes, focus -- and none
+of that was involved.
+
+It was still worth fixing and the check still worth keeping, for the case that
+is coming rather than the one that happened: the day one of those buttons grows
+a tooltip or opens a popup, the same collision stops being harmless and starts
+being silent. `ui_smoke` now records the id ImGui gave each widget alongside its
+probe and compares them directly -- one pass over one frame per screen,
+covering every widget rather than only the ones a mouse can reach. Six states
+are checked: board, live, split board, and each modal drawn over a board that
+is still there.
+
+The first version of that check hovered every widget in turn and took 28
+seconds. It also left the modals it opened *stale*: clearing an open flag stops
+a modal being drawn but leaves the popup on ImGui's stack, and a stale one
+blocks every click behind it for the rest of the run. Both are fixed; the check
+costs about two seconds. Two of those tests are new, and both exist because their
+subject has a right answer that can be written down.
+
+`pitch_detect_test` (30 checks): 440 Hz reads 440.0 Hz and A4 at 0.0002 cents;
+detunes of ±7 and ±20 cents come back within 0.003; all six open guitar
+strings and a bass low E read correctly as *plucked* tones with the
+fundamental quieter than its own second harmonic; middle C is C4 and the
+guitar's low E is E2, which is the octave numbering nothing else would catch;
+and silence, a chord, a short window, no samples and no sample rate each
+report nothing rather than a note.
+
+`metronome_test` (18 checks): every beat exactly 24000 frames after the last
+at 120 BPM; the same beat placements at block sizes of 13, 64, 512 and 1024;
+40, 60, 90 and 240 BPM each landing on their exact period; the downbeat
+audibly unlike the beats after it and repeating on the next bar; silence when
+stopped and at zero level; and the click summing into the output rather than
+overwriting it.
+
+`ui_smoke` grew the four screens: the Board|Live switch and a live screen with
+no board drawn behind it, the mappings table's row count against the sidebar's
+figure, the plugin-UI modal's controls answering to their own probe names, the
+audio modal's two entry points differing only in Cancel, the tuner's three
+display states, and each metronome control asking for its own thing and only
+its own thing.
+
+Six injected regressions, each caught: a card offering an editor for every
+plugin; the mappings table dropping a row; live Next always jumping to the
+first preset; a first run offering Cancel; pitch detection without sub-sample
+interpolation (which fails at exactly the +1.4 and −14.4 cents its comment
+predicts); and a metronome checking beats per block instead of per sample
+(24064 frames instead of 24000).
+
+Three of this round's own tests were caught asserting nothing before they
+asserted anything: a negative check on a *collapsed* card, which draws no body
+at all; a slider clicked at its midpoint when the fixture already sat there;
+and a beat detector that found dozens of starts per click because a decaying
+sine crosses zero every half cycle. All three now start from somewhere the
+click can move.
+
+**Not covered, and it needs ears:** whether the tuner is quick enough to be
+usable between songs, whether the click sits right against a band, and whether
+the live screen is actually legible at two metres -- which is the entire
+argument for its type sizes and the one thing no assertion here touches.
+
+### Phase F — closing out
+
+- [x] **SF-83**: Documentation, and the design bundle itself. Unzip
+  `design/LV2 Pedalboard Host.zip` into the repo so the tokens and the
+  handoff README are readable without a zip tool, and point README at it as
+  the authority for values. Then PLAN.md: §8 (UI) rewritten around the two
+  screens and seven modals it now has; §2 non-goals, where tuner,
+  metronome and banks have stopped being non-goals and should say what they
+  became rather than just vanishing; §5.1 for the `splitter` object. Reads
+  alongside SF-59, which is the same job for Milestone 9 and is still open.
+
+  Done together with SF-59, since they are one edit to one document. The
+  non-goals are **rewritten rather than deleted**: what a project decided not
+  to do is worth keeping legible, and "we said no to this and then did it, for
+  these reasons" tells a reader more than a gap does. Two of the three are
+  still true and now say what is actually limited -- no *drag-and-drop* (the
+  board is a graph, edited by buttons that name what they do), and no suil
+  embedding (the modal says so where a plugin has an editor).
+
+  §4.2 was written as a future milestone and now records what shipped,
+  including the two places it guessed wrong: there is no separate merge node,
+  and an empty branch is legal rather than degenerate. §5.1 gains the `graph`
+  form and the `splitter` object, with the rules that keep old files
+  byte-identical. §7 recommended mono-only end to end; what shipped adapts
+  between neighbours, because a board with one stereo pedal in it turned out
+  to be the ordinary case rather than the exotic one.
+
+  The design bundle was already unzipped in the tree; README and PLAN.md now
+  name it as the authority for values, with `src/ui/Theme.h` as its
+  transcription.
+- [ ] **SF-84**: The pass that needs eyes. Everything above is asserted as
+  structure and behaviour; **none of it is a claim that the window looks
+  right.** On a real screen at the real size: whether 330px is the right
+  sidebar, whether 28 segments read as a meter or as a smear, whether 84px
+  is too big for the Live preset name, whether the amber and the meter
+  green fight each other, whether 11px mono is legible. Then the same on
+  the Pi at whatever resolution the board actually runs at, where the
+  design's 1× metrics may not be what a 7" panel wants.
+
+  Same standing limitation as SF-28 through SF-30, SF-38, SF-41 and Phase
+  C's own: the tests prove the intent was implemented, not that the intent
+  was right.
+
+  **Still open, and it is the one task here that cannot be finished without a
+  person and a screen.** Every question it asks -- whether 84px is too big,
+  whether the amber and the meter green fight, whether 11px mono is legible at
+  arm's length on a 7" panel -- is a judgement about what an eye does with a
+  rendered pixel, and nothing in this repository can answer one.
+
+  What *was* checkable has been checked, and it is worth separating from what
+  has not: **the transcription is faithful.** `src/ui/Theme.h` and `Fonts.h`
+  were compared field by field against the bundle's tokens --
+  21 colours, the whole 4/8/12/16/20/24px spacing scale, all three radii, and
+  every step of the type scale from 11px to 46px. Nothing differs. So if the
+  window looks wrong, it is the design's figures that are wrong for this
+  screen, not a value that was mistyped on the way in -- which is the more
+  useful of the two things to have ruled out before anyone sits down with a
+  Pi.
 
 ---
+
+## Milestone 11 — the built-in noise gate
+
+- [x] **SF-85**: A noise gate built into the board rather than reached for as a
+  plugin. Every high-gain preset needs one, and requiring the player to install
+  and insert one makes the board's most universally-needed pedal the one thing
+  it cannot supply itself.
+
+  **Per preset**, not board-wide: a high-gain lead gates hard and a clean tone
+  should not gate at all, and one threshold cannot serve both. It is a
+  `NoiseGateSettings` on `Preset`, not a node on the graph -- a gate is what the
+  board does to its *input*, and making it a stage would put it somewhere it
+  could be moved to where it does not belong.
+
+  **Threshold and release are the only controls.** Attack, hold, hysteresis, the
+  detector's decay and its high-pass are fixed; the numbers and the reasoning
+  are in `NoiseGate.cpp`, which is the place to argue with them.
+
+  **Where it runs is the whole design.** In `JackEngine::Process`, in place on
+  `input_scratch_`, *after* the tuner tap and *before* the chain. Sitting there
+  needs no restructuring only because `ConnectAudioPort` hands over a pointer
+  rather than a copy, so mutating the buffer before `Run` is seen by the chain
+  -- and by both hosts during a crossfade, which is what gives a preset switch
+  one continuous gate rather than two fighting inside the fade.
+
+  Two orderings there are load-bearing and invisible once they work. The input
+  meter is measured *before* the gate, so it keeps showing the ungated signal --
+  which matters because the meter is what the threshold is set against, and one
+  reading silence exactly when you need to see what you are cutting is no use.
+  And the tuner taps before the gate, so tuning is never gated: a quietly
+  plucked string is precisely what a gate removes.
+
+  **The preset is the value and the engine is a sink.** Written that way round
+  deliberately: if an edit went only to the engine, `CaptureChainPresetInto`
+  would snapshot a stale `current_source.gate` and a save would silently throw
+  the change away. The only thing read back *from* the engine is the live gain
+  for the indicator, which is a meter rather than a setting.
+
+  The absent-object rule from SF-46 and SF-75 applies unchanged: a gate equal to
+  its default is omitted on save, an absent one parses as that default, and
+  `enabled` defaults false -- so every preset written before this round-trips
+  byte-identical *and* sounds identical. Out-of-range numbers clamp rather than
+  refuse; a threshold has silly values, not wrong ones. Wrong *types* are still
+  refused, with the field named.
+
+  *Acceptance: the arithmetic every slider promises is asserted rather than
+  listened for; a preset with no gate is unchanged in file and in sound.*
+
+**Verification.** `ctest` is green: 29 tests, one new.
+
+`noise_gate_test` (34 checks) covers the timing the sliders promise -- the
+release reaches −60 dB at exactly 2880, 9600 and 24000 samples for 60, 200 and
+500 ms at 48 kHz, and means the same in milliseconds at 96 kHz -- plus: a gate
+never enabled is bit-identical *and does no per-sample work at all* (the frame
+counter is what tells "returned early" from "multiplied by 1.0f"); a closed gate
+reaches exactly `0.0f` rather than trickling denormals into every plugin
+downstream; both channels take one gain so a stereo image cannot collapse; and
+the same samples at block sizes 13, 64, 256 and 1024.
+
+Then the failure modes a gate actually has in the field: a NaN must not wedge it
+shut, a DC offset must not wedge it open, enabling it mid-note must not cut the
+note, and disabling it while shut must ramp rather than step -- that last one
+lands exactly on a preset change, where the crossfade has just gone to the
+trouble of avoiding a click.
+
+Five injected regressions. Three were caught at once: no denormal flush, a
+short hold, and a disable that steps instead of ramping. **The other two are the
+interesting ones.**
+
+The NaN guard was *incomplete when written* and the test found it: clearing the
+envelope is not enough, because the detector's own high-pass state stays NaN,
+every later sample filters to NaN, and the gate sits shut forever. The symptom
+would have been a board that goes permanently silent after one bad sample.
+
+And the chatter test was **asserting nothing**. It used a note 10 dB clear of
+the threshold, which cannot ripple below the close threshold however short the
+hold -- an injected 5 ms hold sailed straight through it. Moved to just above
+the threshold, where a real gate chatters. That also turned up something worth
+recording: hold and detector decay are *redundant* here, and shortening either
+alone still passes. It takes losing both. Two cheap mechanisms covering one
+another is the right trade for a failure that sounds like a broken amp, but it
+means neither constant is justified by a test on its own, and the comments now
+say so rather than claiming credit for the hold.
+
+**The gate, splitter and mixer cards all start collapsed.** Three open cards
+push the pedals -- which are what the board is actually about -- a long way down
+the page, and on a split board the chain area would open showing more settings
+than signal path. Each header carries its current setting when shut (`off`,
+`crossover at 800 Hz`, `A 0.0 dB / B 0.0 dB`), so closing costs the ability to
+*change* them at a glance, not to read them.
+
+That did cost something, and it is fixed rather than accepted: the gate's live
+indicator lives in the card body, so collapsing by default would have hidden the
+one reading a player needs while setting a threshold. The shut header says what
+the gate is *doing* as well as what it is set to -- `-50 dB, 200 ms release --
+cutting`. `ui_smoke` asserts all three come up collapsed and opens each by its
+header, so the default and the expand affordance are both covered.
+
+**Not covered, and it needs ears:** whether −50 dB and 200 ms are good defaults
+for a real guitar into a real interface, and whether the gate is tight enough in
+front of a high-gain amp model. It also cannot do what a four-cable-method gate
+does and sit *after* a preamp; that would be a stage, not this.
+
+- [x] **SF-86**: Collapsing to one channel and back puts the pedals where they
+  were. Going from two channels to one flattens both lanes into the trunk, which
+  throws away the one thing the player cared about -- *which* channel each pedal
+  was on -- so pressing `2 channels` again gave an empty split beside a series
+  of pedals rather than the board they had a moment ago.
+
+  **It could not have worked as the code stood.** `RejoinSplit` rescued each
+  pedal's `PresetStage` *values* and re-inserted them with `InsertPlugin`, which
+  mints a fresh id -- so a collapse silently renumbered every pedal in the
+  split, and nothing afterwards could say which one had been where. Ids are
+  documented as stable identity; this was quietly breaking that. `TakeNode` and
+  `InsertNode` detach and attach a node *keeping* its id, and the collapse uses
+  them, which is a fix worth having on its own.
+
+  The layout is remembered **in the preset**, so collapse, save, reload, expand
+  still restores it and switching preset and back does not lose it. It names
+  pedals by id rather than by position, which is what makes editing while
+  flattened degrade sensibly: a pedal removed since is skipped, one added stays
+  on the trunk, and if nothing remembered survives the restore declines and the
+  caller makes a plain empty split. The memory is spent on use -- leaving it
+  would mean a second round trip restoring a layout two edits stale.
+
+  Everything about the split comes back, not only the pedals: the splitter's
+  mode, frequency and sends, and both channels' levels and mutes. Losing a
+  crossover on the way through would be the same surprise as losing the layout.
+
+  Absent when there is nothing to remember and omitted from the file then, the
+  same rule as ids (SF-46), the splitter (SF-75) and the gate (SF-85). A
+  *malformed* one is ignored rather than refused, which is the one place this
+  codebase does that: it is a convenience the board left itself, not something
+  the player wrote, and taking a preset away over it would trade a file for a
+  layout that can be rebuilt by hand in seconds.
+
+  *Acceptance: collapse and expand is a round trip -- same trunk, same pedals on
+  the same channels in the same order, same splitter and levels.*
+
+**Verification.** `ctest` is green: 30 tests, one new.
+
+`RejoinSplit` and `RestoreSplit` moved out of `main.cpp` into
+`src/preset/SplitEdit.{h,cpp}` to make any of this checkable -- they are graph
+surgery and touch no engine, no plugins and no files, so `split_edit_test` (32
+checks) asserts the round trip directly: the trunk comes back identical, each
+channel has its own pedals in order, ids survive the collapse, and the splitter
+and both levels return with them. Then the cases a real board hits: a pedal
+removed while flattened, one added, and every remembered pedal gone -- which
+declines rather than leaving a half-built split behind.
+
+Two things the injected regression turned up. Putting the old id-minting
+collapse back fails the round trip, as intended -- but it did so by
+**segfaulting**, because the test dereferenced the split a failed restore never
+created. That is the same flaw Phase B recorded ("it indexed a vector it had
+only checked the size of, so a failure segfaulted instead of naming the broken
+assertion"), and it is now guarded: the same injection reports six named
+failures instead of a crash.
 
 ### Suggested first few sessions
 

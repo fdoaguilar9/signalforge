@@ -89,6 +89,16 @@ struct AudioSettingsViewState
 	std::string input_filter;
 	std::string output_filter;
 
+	// How many channels the board takes in (SF-76): 1 or 2. Not the auto
+	// (`0`) that AudioConfig also allows -- the dialog always writes a number,
+	// because "as many as the first pedal wants" is a sensible thing for a
+	// config file to say and a confusing thing for a control to show.
+	//
+	// This is what makes the splitter's stereo mode mean anything: with one
+	// input there are no sides to divide, and the splitter card says so
+	// rather than greying itself out.
+	unsigned board_inputs = 1;
+
 	double sample_rate = 48000.0;
 	uint32_t buffer_size = 256;
 

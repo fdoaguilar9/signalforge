@@ -42,6 +42,9 @@ public:
 		, integer_(lilv_new_uri(world, LV2_CORE__integer))
 		, enumeration_(lilv_new_uri(world, LV2_CORE__enumeration))
 		, logarithmic_(lilv_new_uri(world, "http://lv2plug.in/ns/ext/port-props#logarithmic"))
+		, reports_latency_(lilv_new_uri(world, LV2_CORE__reportsLatency))
+		, designation_(lilv_new_uri(world, LV2_CORE__designation))
+		, latency_(lilv_new_uri(world, LV2_CORE__latency))
 	{
 	}
 
@@ -57,6 +60,9 @@ public:
 		lilv_node_free(integer_);
 		lilv_node_free(enumeration_);
 		lilv_node_free(logarithmic_);
+		lilv_node_free(reports_latency_);
+		lilv_node_free(designation_);
+		lilv_node_free(latency_);
 	}
 
 	ClassNodes(const ClassNodes&) = delete;
@@ -75,6 +81,13 @@ public:
 	LilvNode* integer_;
 	LilvNode* enumeration_;
 	LilvNode* logarithmic_;
+
+	// Two spellings of the same thing: lv2:designation lv2:latency is the
+	// current one, lv2:reportsLatency the older property. Plugins in the wild
+	// use both, so both are accepted.
+	LilvNode* reports_latency_;
+	LilvNode* designation_;
+	LilvNode* latency_;
 };
 
 }  // namespace
@@ -125,6 +138,26 @@ std::vector<PortInfo> ClassifyPorts(LilvWorld* world, const LilvPlugin* plugin)
 			info.integer = lilv_port_has_property(plugin, port, classes.integer_);
 			info.enumeration = lilv_port_has_property(plugin, port, classes.enumeration_);
 			info.logarithmic = lilv_port_has_property(plugin, port, classes.logarithmic_);
+
+			if (lilv_port_has_property(plugin, port, classes.reports_latency_))
+			{
+				info.reports_latency = true;
+			}
+			else
+			{
+				LilvNodes* designations = lilv_port_get_value(plugin, port, classes.designation_);
+
+				LILV_FOREACH (nodes, d, designations)
+				{
+					if (lilv_node_equals(lilv_nodes_get(designations, d), classes.latency_))
+					{
+						info.reports_latency = true;
+						break;
+					}
+				}
+
+				lilv_nodes_free(designations);
+			}
 		}
 		else if (lilv_port_is_a(plugin, port, classes.atom_))
 		{

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="_ds/signalforge-design-system-cc3c6bcb-dd11-48f7-9aa7-90c10586e198/tokens/fonts.css">
+<link rel="stylesheet" href="_ds/signalforge-design-system-cc3c6bcb-dd11-48f7-9aa7-90c10586e198/styles.css">
+<script src="_ds/signalforge-design-system-cc3c6bcb-dd11-48f7-9aa7-90c10586e198/_ds_bundle.js"></script>
+</helmet>
+<div style="background:var(--bg-surface);border:1px solid var(--border-hairline);border-radius:var(--radius-md);box-shadow:var(--shadow-panel);padding:12px 16px;font-family:var(--font-ui)">
+  <div style="display:flex;align-items:center;gap:8px">
+    <span onClick="{{ stage.onToggleExpand }}" style="cursor:pointer;color:var(--text-secondary);width:14px">{{ stage.arrow }}</span>
+    <input type="checkbox" checked="{{ stage.enabled }}" onChange="{{ stage.onToggleBypass }}" style="accent-color:var(--accent-primary)" title="Bypass this stage">
+    <span style="flex:1;min-width:0;color:{{ stage.nameColor }}" title="{{ stage.uri }}">{{ stage.name }}</span>
+    <span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-secondary)">{{ stage.label }}</span>
+    <button onClick="{{ stage.onMoveUp }}" title="Move earlier in the chain" style="width:24px;height:24px;background:var(--bg-surface-raised);color:var(--text-secondary);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);cursor:pointer;font-family:var(--font-mono);font-size:var(--text-xs)">^</button>
+    <button onClick="{{ stage.onMoveDown }}" title="Move later in the chain" style="width:24px;height:24px;background:var(--bg-surface-raised);color:var(--text-secondary);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);cursor:pointer;font-family:var(--font-mono);font-size:var(--text-xs)">v</button>
+    <button onClick="{{ stage.onRemove }}" title="Remove this stage" style="width:24px;height:24px;background:var(--bg-surface-raised);color:var(--text-secondary);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);cursor:pointer;font-family:var(--font-mono);font-size:var(--text-xs)">x</button>
+  </div>
+  <sc-if value="{{ stage.expanded }}" hint-placeholder-val="{{ false }}">
+  <div style="margin-top:12px;padding-left:24px;display:flex;flex-direction:column;gap:12px">
+  <div style="display:flex;align-items:center;gap:12px">
+    <span style="font-size:var(--text-xs);color:var(--text-secondary)">Bypass</span>
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ stage.bypassBound }}" binding-text="{{ stage.bypassBinding }}" armed="{{ stage.armed }}" on-click="{{ stage.onLearnBypass }}" hint-size="auto,26px"></x-import>
+    <div style="flex:1"></div>
+    <sc-if value="{{ stage.hasUi }}" hint-placeholder-val="{{ false }}">
+      <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="secondary" size="sm" on-click="{{ stage.onOpenUi }}" hint-size="auto,28px">Open plugin UI</x-import>
+    </sc-if>
+  </div>
+  <sc-for list="{{ stage.paths }}" as="p" hint-placeholder-count="0">
+    <div style="display:flex;align-items:center;gap:12px">
+      <span style="font-size:var(--text-xs);color:var(--text-secondary);min-width:52px" title="{{ p.tooltip }}">{{ p.label }}</span>
+      <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="secondary" size="sm" on-click="{{ p.onPick }}" hint-size="auto,28px">{{ p.fileName }}</x-import>
+    </div>
+  </sc-for>
+  <sc-for list="{{ stage.controls }}" as="c" hint-placeholder-count="2">
+    <div style="display:flex;align-items:center;gap:12px">
+      <sc-if value="{{ c.slider }}" hint-placeholder-val="{{ true }}">
+        <div style="flex:1;min-width:0;max-width:420px">
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="{{ c.label }}" value="{{ c.value }}" min="{{ c.min }}" max="{{ c.max }}" unit="{{ c.unit }}" logarithmic="{{ c.logarithmic }}" on-change="{{ c.onChange }}" hint-size="260px,44px"></x-import>
+        </div>
+      </sc-if>
+      <sc-if value="{{ c.toggled }}" hint-placeholder-val="{{ false }}">
+        <div style="flex:1;min-width:0">
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Toggle" checked="{{ c.on }}" label="{{ c.label }}" on-change="{{ c.onToggle }}" hint-size="auto,26px"></x-import>
+        </div>
+      </sc-if>
+      <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ c.bound }}" binding-text="{{ c.binding }}" armed="{{ stage.armed }}" on-click="{{ c.onLearn }}" hint-size="auto,26px"></x-import>
+    </div>
+  </sc-for>
+  </div>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:760,&quot;height&quot;:300},&quot;stage&quot;:{&quot;editor&quot;:null,&quot;tsType&quot;:&quot;object&quot;}}"></script>
+</body>
+</html>

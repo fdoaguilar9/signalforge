@@ -17,5 +17,26 @@
 
 	// Expression pedal on the amp's gain, scaled into the port's range.
 	{ "type": "cc", "channel": 0, "number": 11, "action": "set_control", "stage": 0, "port": "input",
-	  "min": -20.0, "max": 20.0 }
+	  "min": -20.0, "max": 20.0 },
+
+	// A footswitch for stepping banks. One direction only, which is what the
+	// design draws -- prev_bank exists and is bound the same way if you have a
+	// switch to spare.
+	{ "type": "cc", "number": 83, "action": "next_bank" },
+
+	// The board-wide trims. These are settings rather than part of any preset,
+	// so a pedal on one of these is trimming the interface, not the sound.
+	{ "type": "cc", "channel": 0, "number": 20, "action": "set_input_gain", "min": -24.0, "max": 24.0 },
+	{ "type": "cc", "channel": 0, "number": 21, "action": "set_output_gain", "min": -24.0, "max": 24.0 },
+
+	// The splitter and the merge. "port" names which control, since which ones
+	// the splitter has depends on the mode it is in.
+	{ "type": "cc", "channel": 0, "number": 22, "action": "set_splitter", "port": "crossover",
+	  "min": 20.0, "max": 20000.0 },
+	{ "type": "cc", "channel": 0, "number": 23, "action": "set_mixer", "port": "a", "min": -60.0, "max": 6.0 },
+	{ "type": "cc", "channel": 0, "number": 24, "action": "set_mixer", "port": "b", "min": -60.0, "max": 6.0 },
+
+	// The metronome: a switch to start and stop it, a pedal for the tempo.
+	{ "type": "cc", "number": 84, "action": "toggle_metronome" },
+	{ "type": "cc", "channel": 0, "number": 25, "action": "set_tempo", "min": 40.0, "max": 240.0 }
 ]

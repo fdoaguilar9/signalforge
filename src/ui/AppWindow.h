@@ -45,6 +45,14 @@ public:
 	bool IsOpen() const { return window_ != nullptr; }
 
 private:
+	// Writes one frame to a file when SIGNALFORGE_UI_CAPTURE names one. A
+	// development aid for looking at what was actually drawn -- see the
+	// definition for why it exists at all.
+	void CaptureFrame();
+
+	// Counts every frame presented, so a capture can name one.
+	long frame_index_ = 0;
+
 	SDL_Window* window_ = nullptr;
 	SDL_Renderer* renderer_ = nullptr;
 

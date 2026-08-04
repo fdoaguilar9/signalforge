@@ -45,6 +45,12 @@ struct PortInfo
 	bool integer = false;      // lv2:integer
 	bool enumeration = false;  // lv2:enumeration
 	bool logarithmic = false;  // pprops:logarithmic
+
+	// The plugin's own latency readout: a control *output* port designated
+	// lv2:latency (or carrying the older lv2:reportsLatency property), whose
+	// value is how many samples of delay the plugin adds. There is at most
+	// one. Needed to keep the two lanes of a split time-aligned (SF-51).
+	bool reports_latency = false;
 };
 
 const char* ToString(PortType type);

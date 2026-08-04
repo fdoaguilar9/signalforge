@@ -1,6 +1,9 @@
 #include "AppWindow.h"
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <thread>
 
 #include <SDL.h>
@@ -8,6 +11,9 @@
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_sdlrenderer2.h"
+
+#include "Fonts.h"
+#include "Theme.h"
 
 namespace sf
 {
@@ -19,6 +25,14 @@ namespace
 // on a Pi sharing a machine with a real-time audio thread, every frame not
 // drawn is headroom.
 constexpr uint64_t kMinFrameMs = 16;
+
+// What SDL clears to before Dear ImGui draws over it. The app background, so
+// that the one frame between clear and draw isn't a different colour, and so
+// that a resize showing bare renderer for an instant shows the right bare
+// renderer.
+constexpr Uint8 kClearRed = 22;    // --bg-app #16171a
+constexpr Uint8 kClearGreen = 23;
+constexpr Uint8 kClearBlue = 26;
 
 }  // namespace
 
@@ -67,7 +81,21 @@ bool AppWindow::Open(const char* title, int width, int height, std::string& erro
 
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
-	ImGui::StyleColorsDark();
+
+	// The design system, in one call (SF-60). Everything below this line that
+	// looks like a colour decision has already been made.
+	ApplyTheme();
+
+	// The typefaces (SF-61). A failure here is reported and then ignored: the
+	// bundled bitmap font is worse-looking, not broken, and a board that
+	// refuses to open a window because a .ttf moved is a board that can't be
+	// played.
+	std::string font_warning;
+
+	if (!fonts::Load(font_warning))
+	{
+		std::fprintf(stderr, "signalforge: %s\n", font_warning.c_str());
+	}
 
 	ImGuiIO& io = ImGui::GetIO();
 
@@ -131,10 +159,15 @@ void AppWindow::EndFrame()
 	const ImGuiIO& io = ImGui::GetIO();
 	SDL_RenderSetScale(renderer_, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
 
-	SDL_SetRenderDrawColor(renderer_, 18, 18, 20, 255);
+	SDL_SetRenderDrawColor(renderer_, kClearRed, kClearGreen, kClearBlue, 255);
 	SDL_RenderClear(renderer_);
 
 	ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer_);
+
+	// Before presenting, because reading back after a present is reading a
+	// buffer the driver may already have swapped away from.
+	CaptureFrame();
+
 	SDL_RenderPresent(renderer_);
 
 	// Presenting is *supposed* to block until the display is ready, but that
@@ -151,6 +184,66 @@ void AppWindow::EndFrame()
 	}
 
 	last_present_ms_ = SDL_GetTicks64();
+}
+
+// Writes one rendered frame to a file, when asked to by the environment.
+//
+// This exists because **a look-and-feel change cannot be verified by a test
+// that only asserts structure** (Milestone 10, SF-84): every ui_smoke
+// assertion is about what was drawn, not about what it looks like, and the
+// dummy video driver the tests run under has no window to photograph. Driven
+// by the environment rather than a CLI flag because it is a development aid,
+// not a feature of the program:
+//
+//   SIGNALFORGE_UI_CAPTURE=/tmp/board.bmp SIGNALFORGE_UI_CAPTURE_FRAME=3 \
+//     signalforge --test-ui 60
+//
+// One frame, named by number, because the alternative is either 200 files or
+// whichever frame happened to be last -- and the last frame of a self-test run
+// is mid-click with a modal open.
+void AppWindow::CaptureFrame()
+{
+	const char* path = std::getenv("SIGNALFORGE_UI_CAPTURE");
+
+	if (!path)
+	{
+		return;
+	}
+
+	const char* frame_text = std::getenv("SIGNALFORGE_UI_CAPTURE_FRAME");
+	const long wanted = frame_text ? std::strtol(frame_text, nullptr, 10) : 0;
+
+	if (frame_index_++ != wanted)
+	{
+		return;
+	}
+
+	int width = 0;
+	int height = 0;
+	SDL_GetRendererOutputSize(renderer_, &width, &height);
+
+	SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
+
+	if (!surface)
+	{
+		std::fprintf(stderr, "signalforge: could not allocate a capture surface: %s\n", SDL_GetError());
+		return;
+	}
+
+	if (SDL_RenderReadPixels(renderer_, nullptr, SDL_PIXELFORMAT_ARGB8888, surface->pixels, surface->pitch) != 0)
+	{
+		std::fprintf(stderr, "signalforge: could not read the frame back: %s\n", SDL_GetError());
+	}
+	else if (SDL_SaveBMP(surface, path) != 0)
+	{
+		std::fprintf(stderr, "signalforge: could not write %s: %s\n", path, SDL_GetError());
+	}
+	else
+	{
+		std::fprintf(stderr, "signalforge: wrote frame %ld to %s\n", wanted, path);
+	}
+
+	SDL_FreeSurface(surface);
 }
 
 void AppWindow::Size(int& width, int& height) const

@@ -103,9 +103,35 @@ bool ReadOptionalString(const nlohmann::json& json, const char* key, std::string
 
 // Does this action fire once per press (a switch), or track a value
 // continuously (a knob/expression pedal)?
+//
+// **Every value-carrying action has to be listed here**, not just the first
+// one anyone wrote. A continuous action left out reads as a switch: an
+// expression pedal at 0 looks like a release and never fires, and one held
+// still repeats nothing -- so the control simply stops responding below
+// halfway, which is a symptom nobody would connect back to this function.
 bool IsSwitchAction(MidiAction action)
 {
-	return action != MidiAction::SetControl;
+	switch (action)
+	{
+		case MidiAction::SetControl:
+		case MidiAction::SetInputGain:
+		case MidiAction::SetOutputGain:
+		case MidiAction::SetSplitterControl:
+		case MidiAction::SetMixerLevel:
+		case MidiAction::SetTempo:
+			return false;
+
+		case MidiAction::LoadPreset:
+		case MidiAction::NextPreset:
+		case MidiAction::PrevPreset:
+		case MidiAction::ToggleBypass:
+		case MidiAction::NextBank:
+		case MidiAction::PrevBank:
+		case MidiAction::ToggleMetronome:
+			break;
+	}
+
+	return true;
 }
 
 }  // namespace
@@ -124,17 +150,38 @@ const char* ToString(MidiAction action)
 			return "toggle_bypass";
 		case MidiAction::SetControl:
 			return "set_control";
+		case MidiAction::NextBank:
+			return "next_bank";
+		case MidiAction::PrevBank:
+			return "prev_bank";
+		case MidiAction::SetInputGain:
+			return "set_input_gain";
+		case MidiAction::SetOutputGain:
+			return "set_output_gain";
+		case MidiAction::SetSplitterControl:
+			return "set_splitter";
+		case MidiAction::SetMixerLevel:
+			return "set_mixer";
+		case MidiAction::SetTempo:
+			return "set_tempo";
+		case MidiAction::ToggleMetronome:
+			return "toggle_metronome";
 	}
 
 	return "unknown";
 }
 
+// Every action, in one place, so that adding one to the enum and forgetting to
+// make it parseable is a compile-time omission rather than a mapping file that
+// mysteriously won't load.
+const MidiAction kAllActions[] = {MidiAction::LoadPreset, MidiAction::NextPreset, MidiAction::PrevPreset,
+	MidiAction::ToggleBypass, MidiAction::SetControl, MidiAction::NextBank, MidiAction::PrevBank,
+	MidiAction::SetInputGain, MidiAction::SetOutputGain, MidiAction::SetSplitterControl, MidiAction::SetMixerLevel,
+	MidiAction::SetTempo, MidiAction::ToggleMetronome};
+
 bool ParseMidiAction(const std::string& text, MidiAction& out)
 {
-	constexpr MidiAction kActions[] = {MidiAction::LoadPreset, MidiAction::NextPreset, MidiAction::PrevPreset,
-		MidiAction::ToggleBypass, MidiAction::SetControl};
-
-	for (MidiAction action : kActions)
+	for (MidiAction action : kAllActions)
 	{
 		if (text == ToString(action))
 		{
@@ -144,6 +191,26 @@ bool ParseMidiAction(const std::string& text, MidiAction& out)
 	}
 
 	return false;
+}
+
+// The list of names an error message offers when it rejects one. Built rather
+// than written out, so it cannot drift from what is actually accepted -- the
+// old hand-written list would have gone stale the moment this grew.
+std::string KnownActions()
+{
+	std::string names;
+
+	for (MidiAction action : kAllActions)
+	{
+		if (!names.empty())
+		{
+			names += ", ";
+		}
+
+		names += ToString(action);
+	}
+
+	return names;
 }
 
 bool MidiBinding::Matches(const MidiEvent& event) const
@@ -210,8 +277,28 @@ nlohmann::json MidiBinding::ToJson() const
 			json["max"] = maximum;
 			break;
 
+		// Named controls on board-wide things: which one, and the range a
+		// pedal sweeps into. No stage, because none of these lives in the
+		// chain.
+		case MidiAction::SetSplitterControl:
+		case MidiAction::SetMixerLevel:
+			json["port"] = port;
+			json["min"] = minimum;
+			json["max"] = maximum;
+			break;
+
+		case MidiAction::SetInputGain:
+		case MidiAction::SetOutputGain:
+		case MidiAction::SetTempo:
+			json["min"] = minimum;
+			json["max"] = maximum;
+			break;
+
 		case MidiAction::NextPreset:
 		case MidiAction::PrevPreset:
+		case MidiAction::NextBank:
+		case MidiAction::PrevBank:
+		case MidiAction::ToggleMetronome:
 			break;
 	}
 
@@ -252,8 +339,7 @@ bool MidiBinding::FromJson(const nlohmann::json& json, MidiBinding& out, std::st
 
 	if (!ParseMidiAction(action_text, out.action))
 	{
-		error = "unknown action \"" + action_text +
-			"\" (expected load_preset, next_preset, prev_preset, toggle_bypass, or set_control)";
+		error = "unknown action \"" + action_text + "\" (expected one of: " + KnownActions() + ")";
 		return false;
 	}
 
@@ -318,11 +404,55 @@ bool MidiBinding::FromJson(const nlohmann::json& json, MidiBinding& out, std::st
 			}
 			break;
 
+		case MidiAction::SetSplitterControl:
+			// Which of the splitter's controls, since which ones exist depends
+			// on its mode. Checked by name here rather than left to the engine
+			// so a typo is a load error with the file in front of you.
+			if (out.port != "send_a" && out.port != "send_b" && out.port != "crossover")
+			{
+				error = "set_splitter needs \"port\" to be send_a, send_b, or crossover, got \"" + out.port + "\"";
+				return false;
+			}
+
+			if (out.minimum == out.maximum)
+			{
+				error = "set_splitter needs \"min\" and \"max\" to differ";
+				return false;
+			}
+			break;
+
+		case MidiAction::SetMixerLevel:
+			if (out.port != "a" && out.port != "b")
+			{
+				error = "set_mixer needs \"port\" to be a or b, got \"" + out.port + "\"";
+				return false;
+			}
+
+			if (out.minimum == out.maximum)
+			{
+				error = "set_mixer needs \"min\" and \"max\" to differ";
+				return false;
+			}
+			break;
+
+		case MidiAction::SetInputGain:
+		case MidiAction::SetOutputGain:
+		case MidiAction::SetTempo:
+			if (out.minimum == out.maximum)
+			{
+				error = std::string(ToString(out.action)) + " needs \"min\" and \"max\" to differ";
+				return false;
+			}
+			break;
+
 		case MidiAction::ToggleBypass:
 			break;
 
 		case MidiAction::NextPreset:
 		case MidiAction::PrevPreset:
+		case MidiAction::NextBank:
+		case MidiAction::PrevBank:
+		case MidiAction::ToggleMetronome:
 			break;
 	}
 
@@ -334,9 +464,16 @@ bool MidiBinding::FromJson(const nlohmann::json& json, MidiBinding& out, std::st
 
 	// A program change carries no value, so it can't drive a continuous
 	// control. Better to say so than to let it jam the port at min forever.
-	if (out.action == MidiAction::SetControl && out.type == MidiEventType::ProgramChange)
+	// Every action that reads a value has the same problem, so they are all
+	// refused rather than only the first one anyone thought of.
+	const bool continuous = out.action == MidiAction::SetControl || out.action == MidiAction::SetInputGain ||
+		out.action == MidiAction::SetOutputGain || out.action == MidiAction::SetSplitterControl ||
+		out.action == MidiAction::SetMixerLevel || out.action == MidiAction::SetTempo;
+
+	if (continuous && out.type == MidiEventType::ProgramChange)
 	{
-		error = "set_control cannot be driven by program_change (it carries no value); use cc";
+		error = std::string(ToString(out.action)) +
+			" cannot be driven by program_change (it carries no value); use cc";
 		return false;
 	}
 

@@ -1,0 +1,53 @@
+:root{
+/* --- base chassis (charcoal, brushed steel) --- */
+--gray-950:#0e0f11;
+--gray-900:#16171a;
+--gray-850:#1c1d20;
+--gray-800:#222327;
+--gray-700:#2c2d32;
+--gray-600:#38393f;
+--gray-500:#525259;
+--gray-400:#75757c;
+--gray-300:#9a9aa1;
+--gray-200:#c2c2c7;
+--gray-100:#e8e6e0;
+--gray-50:#f5f3ee;
+
+/* --- brand accent: tube-glow amber (tolex piping / jewel lamp) --- */
+--amber-900:#5c3a12;
+--amber-700:#96601c;
+--amber-500:#d68a34;
+--amber-400:#e0a458;
+--amber-300:#eabd7f;
+--amber-100:#f7e6ce;
+
+/* --- secondary accent: brushed chrome / steel blue, used sparingly for links & focus --- */
+--steel-500:#6f8ba3;
+--steel-400:#8ea9c0;
+
+/* --- semantic meter colours, taken verbatim from BoardView.cpp's DrawLevelMeter/warning colours --- */
+--meter-comfortable:#3fb359; /* ImVec4(0.25,0.70,0.35,1) */
+--meter-warn:#e6cc33;        /* ImVec4(0.90,0.80,0.20,1) */
+--meter-hot:#f28c26;         /* ImVec4(0.95,0.55,0.15,1) */
+--meter-clip:#e64040;        /* ImVec4(0.90,0.25,0.25,1) */
+--status-warning:#ffb840;    /* ImVec4(1.0,0.72,0.25,1) board warning text */
+--status-unavailable:#ff9966;/* ImVec4(1.0,0.6,0.4,1) audio settings "not connected" */
+
+/* --- semantic aliases --- */
+--bg-app:var(--gray-900);
+--bg-surface:var(--gray-850);
+--bg-surface-raised:var(--gray-800);
+--bg-inset:var(--gray-950);
+--border-hairline:var(--gray-700);
+--border-strong:var(--gray-600);
+--text-primary:var(--gray-100);
+--text-secondary:var(--gray-300);
+--text-disabled:var(--gray-500);
+--accent-primary:var(--amber-400);
+--accent-primary-hover:var(--amber-300);
+--accent-primary-active:var(--amber-500);
+--accent-primary-on:var(--gray-950);
+--link:var(--steel-400);
+--link-hover:var(--steel-500);
+--focus-ring:var(--amber-400);
+}

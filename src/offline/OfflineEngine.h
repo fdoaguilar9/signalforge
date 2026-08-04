@@ -46,9 +46,11 @@ public:
 	// short one -- worth exercising, since plugins are allowed to be handed
 	// fewer frames than the max block length they were configured with.
 	//
-	// `generator(frame_index)` supplies the input sample fed to every input
-	// channel at that frame.
-	Result Run(AudioHost& host, uint64_t total_frames, const std::function<float(uint64_t)>& generator);
+	// `generator(frame_index, channel)` supplies the input sample for one
+	// channel at that frame. Per channel rather than per frame since SF-76:
+	// a board that takes two inputs and divides them between two lanes cannot
+	// be checked at all if both of its channels carry the same signal.
+	Result Run(AudioHost& host, uint64_t total_frames, const std::function<float(uint64_t, uint32_t)>& generator);
 
 private:
 	uint32_t block_size_;
@@ -57,7 +59,17 @@ private:
 // Stateless exponential sine sweep, useful as a generator for Run(): covers
 // a wide frequency range so a misbehaving filter/convolution stage is more
 // likely to produce something non-finite than a single steady tone would.
-std::function<float(uint64_t)> MakeSineSweep(
+//
+// **Channel 0 gets the sweep; every channel after it gets the same sweep 12 dB
+// down.** The two sides have to be distinguishable or a stereo board proves
+// nothing -- swapping which input feeds which lane would come out identical.
+// A quieter copy rather than silence, so that a lane fed from the right is
+// still a lane making sound: "it went quiet" and "it was routed wrong" should
+// not look the same.
+//
+// Channel 0 is untouched by this, so every mono measurement ever taken with
+// it still holds.
+std::function<float(uint64_t, uint32_t)> MakeSineSweep(
 	double sample_rate, double duration_seconds, double start_hz, double end_hz, float amplitude);
 
 }  // namespace sf

@@ -64,6 +64,43 @@ file(WRITE ${preset_dir}/hopeless.json
 "{\n  \"name\": \"Hopeless\",\n  \"chain\": [\n"
 "    { \"uri\": \"${missing_uri}\", \"controls\": {} }\n  ]\n}\n")
 
+# SF-58: the same story inside a split, which is where it gets harder.
+#
+# A missing plugin in a *lane* drops that node like any other. What is
+# different is what it leaves behind: a lane with nothing in it is a dry wire,
+# so a split whose lane was emptied by dropping would sum a dry copy against
+# the other lane -- two correlated signals at unity, +6 dB, a tone nobody
+# saved. That split collapses back to a series instead.
+#
+# An **authored** empty lane is not that case and must survive untouched: it is
+# how a dry parallel path is spelled, and the +6 dB is the point of it.
+
+# One pedal in each lane, and the one in lane A is missing. Lane A is left
+# empty by the drop, so the split has to go and lane B's pedal continues in
+# series.
+file(WRITE ${preset_dir}/split-broken.json
+"{\n  \"name\": \"Split broken\",\n  \"graph\": [\n"
+"    { \"id\": 1, \"branches\": [\n"
+"      { \"nodes\": [ { \"id\": 2, \"uri\": \"${missing_uri}\", \"controls\": { \"gain\": 3 } } ] },\n"
+"      { \"nodes\": [ { \"id\": 3, \"uri\": \"${PLUGIN_URI}\", \"controls\": { \"gain\": 7 } } ] }\n"
+"    ] }\n  ]\n}\n")
+
+# A split with a pedal in each lane and neither missing, so the split stands.
+file(WRITE ${preset_dir}/split-intact.json
+"{\n  \"name\": \"Split intact\",\n  \"graph\": [\n"
+"    { \"id\": 1, \"branches\": [\n"
+"      { \"nodes\": [ { \"id\": 2, \"uri\": \"${PLUGIN_URI}\", \"controls\": { \"gain\": 3 } } ] },\n"
+"      { \"nodes\": [ { \"id\": 3, \"uri\": \"${PLUGIN_URI}\", \"controls\": { \"gain\": 7 } } ] }\n"
+"    ] }\n  ]\n}\n")
+
+# An authored dry lane: legal, ordinary, and must not be collapsed.
+file(WRITE ${preset_dir}/split-dry.json
+"{\n  \"name\": \"Split dry\",\n  \"graph\": [\n"
+"    { \"id\": 1, \"branches\": [\n"
+"      { \"nodes\": [ { \"id\": 2, \"uri\": \"${PLUGIN_URI}\", \"controls\": { \"gain\": 7 } } ] },\n"
+"      { \"nodes\": [] }\n"
+"    ] }\n  ]\n}\n")
+
 function(run_preset name out_hash out_output out_result)
 	execute_process(
 		COMMAND ${SIGNALFORGE} --test-chain --preset ${name} --preset-dir ${preset_dir} --seconds 0.5
@@ -143,3 +180,67 @@ if(NOT output_hopeless MATCHES "none of them are installed")
 endif()
 
 message(STATUS "Missing plugins degrade gracefully: intact=${hash_intact} degraded=${hash_broken} survivor=${hash_survivor}")
+
+# --- SF-58: the same, inside a split ---
+
+run_preset(split-broken hash_split_broken output_split_broken result_split_broken)
+run_preset(split-intact hash_split_intact output_split_intact result_split_intact)
+run_preset(split-dry hash_split_dry output_split_dry result_split_dry)
+
+# 1. **The acceptance.** A preset naming an uninstalled plugin inside a split
+#    still loads and plays.
+if(NOT result_split_broken EQUAL 0)
+	message(FATAL_ERROR
+		"A preset with a missing plugin inside a split failed to load:\n${output_split_broken}")
+endif()
+
+if(NOT output_split_broken MATCHES "skipped-stages:[ 	]*1")
+	message(FATAL_ERROR
+		"A missing plugin inside a lane was not reported as skipped:\n${output_split_broken}")
+endif()
+
+# 2. The split collapsed, and said so. Left standing it would sum a dry copy
+#    against the surviving lane at +6 dB.
+if(NOT output_split_broken MATCHES "collapsing it to a series")
+	message(FATAL_ERROR
+		"A split that lost a whole channel did not say it had collapsed:\n${output_split_broken}")
+endif()
+
+# 3. And what came out is the surviving pedal in series -- the same board the
+#    file describes minus the pedal that is gone, sample for sample.
+if(NOT hash_split_broken STREQUAL hash_survivor)
+	message(FATAL_ERROR
+		"A collapsed split is not the surviving lane on its own.\n"
+		"  split with a missing lane: ${hash_split_broken}\n"
+		"  the survivor in series:    ${hash_survivor}\n"
+		"${output_split_broken}")
+endif()
+
+# 4. A split with both lanes intact is untouched, or check 3 would pass in a
+#    build that collapsed every split it met.
+if(NOT output_split_intact MATCHES "skipped-stages:[ 	]*0")
+	message(FATAL_ERROR "An intact split reported skipped stages:\n${output_split_intact}")
+endif()
+
+if(output_split_intact MATCHES "collapsing it to a series")
+	message(FATAL_ERROR "An intact split was collapsed anyway:\n${output_split_intact}")
+endif()
+
+if(hash_split_intact STREQUAL hash_survivor)
+	message(FATAL_ERROR
+		"An intact split sounds like one lane in series -- it is being collapsed: ${hash_split_intact}")
+endif()
+
+# 5. **An authored dry lane survives.** It is how a dry parallel path is
+#    spelled, and collapsing it would silently delete the blend.
+if(output_split_dry MATCHES "collapsing it to a series")
+	message(FATAL_ERROR "An authored dry lane was mistaken for one emptied by a drop:\n${output_split_dry}")
+endif()
+
+if(hash_split_dry STREQUAL hash_survivor)
+	message(FATAL_ERROR
+		"A dry parallel path sounds like the wet lane alone -- the blend is gone: ${hash_split_dry}")
+endif()
+
+message(STATUS "Splits degrade gracefully: collapsed=${hash_split_broken} intact=${hash_split_intact} "
+	"dry=${hash_split_dry}")

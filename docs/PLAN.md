@@ -2,9 +2,9 @@
 
 A minimal, standalone, pedalboard-style LV2 host for guitarists. Load a chain of
 LV2 plugins (including `neural_amp_modeler.lv2`), save it as a preset, and
-switch presets live with a USB MIDI foot controller. No drag-and-drop graph
-editor — presets are simple ordered lists of effects, with at most a single
-binary split/join added later.
+switch presets live with a USB MIDI foot controller. No drag-and-drop patch
+bay — a preset is a chain read top to bottom, which may divide once into two
+parallel channels and merge back.
 
 ## 1. Goals
 
@@ -18,17 +18,41 @@ binary split/join added later.
 - Per-preset and global MIDI learn: map CC/PC messages to preset switching,
   bypass toggles, and individual plugin parameters (for expression pedals,
   wah, etc).
-- Dead simple UI: a footswitch-like list of presets/slots, not a node editor.
+- Dead simple UI: a board read top to bottom and a live screen of preset
+  tiles, not a node editor.
 
 ## 2. Non-goals (v1)
 
-- No drag-and-drop patch bay / free-form graph editing.
-- No parallel routing beyond a single **binary** split→merge (deferred to a
-  later milestone; the data model should not preclude it, but v1 ships
-  sequential-only).
+Three lines here stopped being true during Milestones 9 and 10. They are
+rewritten rather than deleted: what a project decided *not* to do is worth
+keeping legible, and "we said no to this and then did it, for these reasons"
+is more useful to a reader than a gap.
+
+- No drag-and-drop patch bay. **Still true, and it is the drag-and-drop that
+  is the point** — the board is a graph now (§4.2), but it is edited by
+  buttons that name what they do, not by dragging cables. A gesture that can
+  be made by accident on a stage floor is a gesture this does not have.
+- ~~No parallel routing beyond a single binary split→merge.~~ **The model
+  carries splits at any depth** (SF-45), the engine plans and plays them
+  (SF-49, SF-50, SF-51), and each has a splitter — full range, a 4th-order
+  Linkwitz-Riley crossover, or one side of a stereo input into each lane
+  (SF-75). What is still limited is the *editor*: the board screen draws one
+  split on the trunk, and a preset with more says so and goes read-only
+  rather than drawing half of it (SF-71).
 - No plugin GUI embedding (`suil`) in v1 — control ports are exposed as
-  generic sliders/knobs in our own UI. (Revisit if a plugin is unusable
-  without its custom UI.)
+  generic sliders/knobs in our own UI. **Still true.** The plugin-UI modal
+  (SF-79) says so where a plugin has an editor of its own, and offers the
+  generic controls in its place; the well is an honest placeholder, not a
+  promise.
+- ~~No tuner, metronome or preset banks.~~ All three shipped: banks in SF-67,
+  a tuner with control-thread pitch detection in SF-81, and a metronome
+  scheduled from a sample counter on the audio thread in SF-82.
+- **One piece of DSP is the board's own** rather than a plugin: the noise gate
+  (SF-85), at the input, before the chain. Everything else the board does to
+  the sound is an LV2 plugin the player chose, and that stays the rule -- but a
+  gate has to sit *before* the first pedal to work at all, which is the one
+  place the plugin model cannot reach. It is per preset, and its settings live
+  in the preset file beside the chain.
 - No Windows/Mac support in v1 (architecture should not actively prevent it
   later, since JACK and LV2 exist cross-platform, but it's not a target).
 - No plugin discovery/marketplace — assume plugins are already installed
@@ -121,16 +145,31 @@ never happen inside the audio thread. Approach:
    audio thread has moved on (e.g. a sequence counter bumped once per audio
    callback, control thread waits for it to advance past the swap point).
 
-### 4.2 Binary split (future milestone, not v1)
+### 4.2 The split, as built
 
-Data model should represent a preset as a **tree of nodes**, even though v1
-only ever produces linear chains, so this doesn't require a breaking format
-change later:
+This was written as a future milestone and shipped in Milestone 9. What it
+predicted is roughly what happened, with two differences worth recording.
 
-- `SeriesNode`: ordered list of children (plugin instances or nested nodes).
-- `SplitNode` (future): exactly two children, each fed the same input; a
-  `MergeNode` (future) sums/crossfades them back together. v1's UI simply
-  never exposes creating a `SplitNode`.
+The preset is a tree (`ChainGraph`): an ordered trunk of nodes, where a node
+is either a plugin or a **split** into exactly two branches that run in
+parallel and sum back. Splits nest.
+
+- There is no separate `MergeNode`. A split *is* its merge -- the two are one
+  node -- because every split has exactly one merge and a second concept would
+  only be a second thing to keep in step. Per-lane return level and mute live
+  on the branch (`gain_db`, `muted`); per-lane send level and how the signal
+  divides live on the split's `splitter`.
+- **An empty branch is legal and is not a degenerate case.** It is a straight
+  wire, which is how a dry parallel path is spelled -- and a wet/dry blend is
+  most of why anyone reaches for a split. Requiring a placeholder plugin would
+  have been a worse model, not a stricter one.
+
+The engine does not walk the tree. It is compiled once, on the control thread,
+into a flat list of block operations over single-channel buffers
+(`ChainSchedule`): no recursion, no allocation, and no branching on the audio
+thread beyond a switch on a small enum. Lanes of unequal latency are aligned
+with a delay before they sum, because summing them as they arrive comb-filters
+-- which is the single most likely way for a split to sound wrong.
 
 ## 5. Data model
 
@@ -164,6 +203,46 @@ One file per preset, plus a manifest/index listing them in switch order.
   }
 }
 ```
+
+**A board with a split writes `graph` instead of `chain`**, and the two are
+mutually exclusive -- a file with both is refused rather than one of them
+guessed at. The flat `chain` form is kept for linear boards, and a preset that
+was linear before splits existed still round-trips byte-identical: ids are
+omitted while they are positional (SF-46), and a `splitter` equal to its
+default is omitted entirely (SF-75).
+
+```jsonc
+{
+  "name": "Two amps",
+  "graph": [
+    { "id": 1, "uri": "…comp…", "bypassed": false, "controls": {} },
+    { "id": 2,
+      // Absent, this reads as full range with unity sends -- which is what
+      // every split written before SF-75 meant.
+      "splitter": {
+        "mode": "crossover",   // "full" | "crossover" | "stereo"
+        "freq": 800.0,         // crossover only
+        "send_a": -6.0,        // into each lane, before its stages
+        "send_b": 0.0,
+        "src_a": "left",       // stereo only: "left" | "right" | "sum"
+        "src_b": "right"
+      },
+      "branches": [
+        // gain_db and muted are the *return*: how much of each lane comes
+        // back at the merge. An empty "nodes" is a dry wire, not an error.
+        { "gain_db": 0.0, "muted": false, "nodes": [ { "id": 3, "uri": "…amp A…" } ] },
+        { "gain_db": -3.0, "muted": false, "nodes": [ { "id": 4, "uri": "…amp B…" } ] }
+      ] },
+    { "id": 5, "uri": "…reverb…" }
+  ]
+}
+```
+
+Stage *indices* -- what a MIDI binding and the console commands speak -- are
+the order `ChainGraph::Flatten` reports: the trunk in order, and at a split all
+of branch 0 then all of branch 1 before the trunk resumes. That ordering is the
+definition of a stage index now that the chain is not a list, and the engine,
+the UI and the bindings all have to mean the same one by it.
 
 Reuse LV2's own state serialization (`lilv_state_to_string` /
 `lilv_state_new_from_string`) rather than hand-rolling how each plugin's
@@ -265,38 +344,65 @@ Responsibilities, modeled on `jalv`:
    control thread once the audio thread has stopped referencing the
    instance (see §4.1).
 
-Channel-count mismatches between chained plugins (e.g. a mono-in/mono-out
-amp sim into a stereo IR loader) need explicit handling: either enforce
-mono-only chains in v1 (simplest — most amp-sim + cab-IR chains are mono
-until a stereo effect at the end), or insert an implicit mono→stereo
-duplication stage when a plugin only exposes stereo ports. Recommend
-**starting mono-only end-to-end**, adding a single implicit "widen to
-stereo" at the very end of the chain if the audio backend wants stereo out.
+Channel-count mismatches between chained plugins (e.g. a mono-in/mono-out amp
+sim into a stereo IR loader) needed explicit handling. This recommended
+starting mono-only end-to-end; **what shipped adapts between neighbours
+instead** (SF-48), because a board with one stereo pedal in it turned out to be
+the ordinary case rather than the exotic one.
+
+Two adapters, and only two:
+
+- Mono into a stereo pedal duplicates.
+- Stereo into a mono pedal folds down at −6 dB per side, so a signal that goes
+  mono → stereo → mono comes back at the level it went in.
+
+Anything wider than stereo is **refused rather than guessed at**: there is no
+one right answer for what four channels into two should do, and silently
+picking one is worse than saying so. The board's own input width is a setting
+(`board_inputs`: auto, 1, or 2 — SF-52, SF-76), not a consequence of whichever
+pedal happens to be first.
 
 ## 8. UI
 
-Keep it deliberately small:
+Dear ImGui on SDL2 + OpenGL, as suggested here originally and as built. What
+this section described as one screen is now **two screens and six modals**,
+laid out against a design system whose tokens live in
+`design/design_handoff_pedalboard_ui/` -- that bundle is the authority for
+every colour, size and spacing figure, and `src/ui/Theme.h`, `Fonts.h` and
+`Widgets.h` are its transcription. Where this document and the bundle
+disagree, the bundle wins.
 
-- A vertical/horizontal list of presets (big, foot-friendly targets if a
-  touchscreen is ever used, but primarily this is MIDI-driven — the UI is
-  for *setup*, not live footswitching).
-- Selecting a preset shows its chain as a simple ordered list of plugin
-  names with a bypass toggle per stage and a "remove/reorder" affordance
-  (move up/down — no free-form dragging needed, just up/down buttons).
-- "Add stage": a searchable list of installed LV2 plugins (from
-  `lilv_world_get_all_plugins()`), filtered to audio-effect classes.
-- Per-stage control panel: auto-generated sliders/toggles from the plugin's
-  control ports (name, range, default from its TTL) — no custom per-plugin
-  UI in v1. For a port that's `atom:Path` (our model file / IR file), show
-  a file picker.
-- MIDI-learn mode: click "learn" next to any control/toggle/preset button,
-  then move something on the pedal.
+The window is three horizontal bands -- a header, a body, a status bar -- with
+a learn strip and a missing-plugin banner appearing between the first two when
+they have something to say. The header carries the Board | Live switch and the
+buttons that open the modals.
 
-Suggested toolkit: **Dear ImGui** (immediate-mode, trivial to iterate on,
-no XML/Designer files, easy to keep "simple" per the brief) rendered via
-whatever backend is least friction on Linux (SDL2 + OpenGL, or GLFW). This
-avoids the complexity of Qt/GTK signal/slot boilerplate for what is
-fundamentally a small number of screens.
+**Board** (SF-69 through SF-73) is a 330px sidebar beside the chain area:
+
+- *Sidebar*: bank, the preset list, an engine readout (rate, block size,
+  latency, MIDI bindings, controller) with a DSP gauge, and both meters with
+  the two board-wide trims.
+- *Chain area*: one card per stage, each expandable in place -- controls, file
+  parameters and learn buttons -- separated by `INPUT` / `SPLIT` / `MERGE` /
+  `OUTPUT` rails. A split draws as CHANNEL A and CHANNEL B side by side with a
+  splitter card above and a mixer card below.
+- A shape this editor cannot draw -- two splits on the trunk, or a split
+  inside a lane -- **says so and goes read-only** rather than drawing the part
+  it understands. Half a board shown silently would be worse than a board that
+  admits it needs the file.
+
+**Live** (SF-77) replaces the body: the preset name at 84px, what the next
+stomp lands on, a grid of preset tiles carrying their bindings, and two
+64px stomps. It is the screen read from two metres away with a guitar on,
+which is the whole argument for the type sizes.
+
+**Modals**: the plugin browser and file picker, MIDI mappings (SF-78), plugin
+UI (SF-79), audio settings (SF-80), tuner (SF-81) and metronome (SF-82).
+
+Everything on both screens is driven by a snapshot in and requests out --
+`BoardViewState`. The drawing code touches no engine object, which is what
+lets the whole UI be exercised by a self-test with no plugins installed and no
+audio server running (`--test-ui`).
 
 ## 9. Threading & real-time safety summary
 

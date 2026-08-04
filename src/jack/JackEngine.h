@@ -9,6 +9,8 @@
 #include <jack/midiport.h>
 
 #include "../audio/Crossfade.h"
+#include "../audio/Metronome.h"
+#include "../audio/NoiseGate.h"
 #include "../lv2/AudioHost.h"
 #include "../midi/MidiEvent.h"
 
@@ -99,7 +101,72 @@ public:
 	// runs far faster than the UI redraws: a plain snapshot would show one
 	// arbitrary block out of every six and miss the transient that matters.
 	float TakeInputPeak() { return input_peak_.exchange(0.0f, std::memory_order_relaxed); }
+
+	// A copy of the most recent window of input, for the tuner (SF-81).
+	//
+	// **Copied out rather than analysed in place**, because pitch detection is
+	// far too much work for a process callback -- it walks the window once per
+	// candidate lag. The audio thread's whole job here is to fill a buffer and
+	// say so; the arithmetic happens on whatever thread is drawing.
+	//
+	// Returns false when no complete window has been filled since the last
+	// call, which is the ordinary case at any sensible frame rate: a window is
+	// 4096 samples and a frame is 16 ms. `out` must have room for
+	// `kInputTapSamples`.
+	//
+	// Control thread. Cheap enough to call every frame and answer no.
+	bool TakeInputWindow(float* out);
+
+	// The board's noise gate (SF-85), which runs at the input, after the trim
+	// and before the chain.
+	//
+	// **Owned here, unlike the metronome.** The metronome is external because
+	// it has control-thread behaviour of its own -- tap tempo, a running state,
+	// MIDI actions; the gate is three numbers and a `Process`, and the engine
+	// is the only thing that ever calls it.
+	//
+	// The settings are per *preset*, so the caller pushes them on every preset
+	// switch. The engine is a sink for whichever preset's numbers are current
+	// and never the place they live -- the preset is.
+	NoiseGate& Gate() { return gate_; }
+	const NoiseGate& Gate() const { return gate_; }
+
+	// The click to mix into the output, or null for none (SF-82). Not owned,
+	// and it must outlive the engine's processing.
+	//
+	// Handed to the engine rather than built by it: the metronome is a
+	// control-thread object with settings a player changes, and jack/ has no
+	// business owning one -- its job is to give the click somewhere to land
+	// after the trim.
+	void SetMetronome(Metronome* metronome) { metronome_ = metronome; }
+
+	// Whether to fill that window at all. Off by default: a board nobody is
+	// tuning should not be copying audio into a buffer nobody reads.
+	void SetInputTapEnabled(bool enabled) { tap_enabled_.store(enabled, std::memory_order_relaxed); }
+
 	float TakeOutputPeak() { return output_peak_.exchange(0.0f, std::memory_order_relaxed); }
+
+	// Share of each block's time budget spent in the process callback, 0..1.
+	// Read rather than taken: it is a running average, not a tally, so reading
+	// it must not reset it.
+	//
+	// Above 1.0 is possible and is not clamped here -- it means the callback
+	// took longer than the block it was given, which is an xrun about to
+	// happen, and hiding that behind a full bar would lose the one reading
+	// that explains the noise.
+	float DspLoad() const { return dsp_load_.load(std::memory_order_relaxed); }
+
+	// The board-wide trims (SF-66): one before the first stage, one after the
+	// last. Deliberately not plugins -- a plugin would be a stage, would take
+	// a slot on the board, and would be saved into every preset. These trim
+	// the interface, so they live in settings.
+	//
+	// Ramped across a block when they change, so a slider drag is silent.
+	void SetInputGainDb(float db);
+	void SetOutputGainDb(float db);
+
+	float InputGainDb() const { return input_gain_db_.load(std::memory_order_relaxed); }
+	float OutputGainDb() const { return output_gain_db_.load(std::memory_order_relaxed); }
 
 	// Monotonic count of blocks in which at least one output sample reached
 	// full scale. A count rather than a flag so the reader can tell "clipping
@@ -135,6 +202,12 @@ public:
 	// queue holds before the control thread drains it, the oldest are
 	// dropped and DroppedMidiEvents() counts them.
 	bool PopMidiEvent(MidiEvent& out);
+
+	// How many samples one tuner window is. Fixed here rather than taken from
+	// the detector's header so that jack/ stays a layer that knows nothing
+	// about what is done with what it hands over; the two are checked against
+	// each other where they meet.
+	static constexpr uint32_t kInputTapSamples = 4096;
 
 	uint64_t DroppedMidiEvents() const { return midi_dropped_.load(std::memory_order_acquire); }
 
@@ -187,6 +260,10 @@ private:
 	static int ProcessCallback(jack_nframes_t nframes, void* arg);
 	int Process(jack_nframes_t nframes);
 
+	// Folds one block's elapsed time into the running DSP figure. Audio
+	// thread; allocates nothing.
+	void RecordDspLoad(uint64_t started_us, uint32_t nframes);
+
 	// JACK calls this with processing stopped, so it may allocate -- which is
 	// the only reason the crossfade scratch buffers can be resized at all.
 	static int BufferSizeCallback(jack_nframes_t nframes, void* arg);
@@ -197,8 +274,35 @@ private:
 	// not wrong in any way a player could see, and ordering it against the
 	// audio would cost more than it's worth.
 	std::atomic<float> input_peak_{0.0f};
+
+	// The tuner's tap (SF-81). Two buffers rather than a ring with a read
+	// pointer: the audio thread fills one while the control thread reads the
+	// other, and `tap_ready_` hands one over whole. A ring the reader chased
+	// could be overwritten underneath it mid-window, and half of one window
+	// followed by half of the next is a *periodic-looking* signal -- it would
+	// not read as noise, it would read as a confident wrong note.
+	std::vector<float> tap_buffer_[2];
+	uint32_t tap_fill_ = 0;                 // audio thread only
+	unsigned tap_writing_ = 0;              // audio thread only
+	std::atomic<int> tap_ready_{-1};        // which buffer is complete, or -1
+	std::atomic<bool> tap_enabled_{false};
+
+	// Read by the audio thread, set once before processing starts.
+	Metronome* metronome_ = nullptr;
+
+	NoiseGate gate_;
 	std::atomic<float> output_peak_{0.0f};
 	std::atomic<uint64_t> output_clips_{0};
+
+	// What fraction of each block's wall-clock budget the callback spent
+	// (SF-65). Smoothed on the audio thread rather than in the view, so that
+	// every block is counted -- the UI draws at 60 Hz and the engine may run
+	// ten blocks between frames, and sampling would miss exactly the spikes
+	// worth seeing.
+	//
+	// Relaxed, like the meters above, and for the same reason: this is a
+	// number to look at, not one to make a decision from.
+	std::atomic<float> dsp_load_{0.0f};
 
 	jack_client_t* client_ = nullptr;
 
@@ -228,6 +332,29 @@ private:
 	// over each other. Allocated in Start(), never on the audio thread.
 	std::vector<std::vector<float>> outgoing_scratch_;
 	std::vector<std::vector<float>> incoming_scratch_;
+
+	// Where the trimmed input lands (SF-66). A copy is unavoidable: JACK's
+	// input port buffers are the server's, to be read and not written, so the
+	// gain cannot be applied in place the way the output's can.
+	std::vector<std::vector<float>> input_scratch_;
+
+	// The board-wide trims, as linear multipliers. Converted from dB on the
+	// control thread so the audio thread never calls pow().
+	//
+	// Two values each: what the control thread asked for, and what the audio
+	// thread last applied. The block ramps from one to the other, because a
+	// gain that jumps mid-drag is a click on every slider movement.
+	std::atomic<float> input_gain_{1.0f};
+	std::atomic<float> output_gain_{1.0f};
+
+	// Audio thread only.
+	float input_gain_applied_ = 1.0f;
+	float output_gain_applied_ = 1.0f;
+
+	// Kept in dB as well, purely so the view can read back what it set without
+	// a log() of a float that has been through a conversion.
+	std::atomic<float> input_gain_db_{0.0f};
+	std::atomic<float> output_gain_db_{0.0f};
 
 	// Blocks (control thread) until a published crossfade has completed.
 	// Returns false on timeout.

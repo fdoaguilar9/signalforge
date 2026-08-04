@@ -11,13 +11,40 @@ namespace sf
 {
 
 // What an incoming MIDI message does. PLAN.md §5.2.
+//
+// The last six arrived with Milestone 10 (SF-68), for the things the redesign
+// put on screen with a learn button beside them. They follow the same rule as
+// the first five and it is the rule that matters: **a binding's target is
+// positional, never an identity.** The mapping file is global and outlives any
+// one preset, so "the mixer's channel A" and "the second pedal" mean whatever
+// is in that position in whatever preset is loaded -- which is what a player
+// bound their footswitch to. See SF-47 for why the alternative was refused.
 enum class MidiAction
 {
-	LoadPreset,   // switch to a named preset
-	NextPreset,   // step forward in the preset library
-	PrevPreset,   // step back
-	ToggleBypass, // flip one chain stage in/out
-	SetControl    // drive a control port continuously
+	LoadPreset,    // switch to a named preset
+	NextPreset,    // step forward in the preset library
+	PrevPreset,    // step back
+	ToggleBypass,  // flip one chain stage in/out
+	SetControl,    // drive a control port continuously
+
+	NextBank,  // step to the next bank, landing on its first preset
+	PrevBank,
+
+	// The board-wide trims, which are settings rather than part of any preset.
+	SetInputGain,
+	SetOutputGain,
+
+	// The splitter: `port` names which of its controls, since which ones exist
+	// depends on the mode -- "send_a", "send_b", or "crossover".
+	SetSplitterControl,
+
+	// The merge: `port` is "a" or "b". Reusing `port` rather than adding a
+	// lane field, because that is exactly what it already means -- the name of
+	// a control on a thing.
+	SetMixerLevel,
+
+	SetTempo,        // the metronome's BPM
+	ToggleMetronome  // start / stop it
 };
 
 const char* ToString(MidiAction action);

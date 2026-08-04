@@ -1,5 +1,7 @@
 #include "JackEngine.h"
 
+#include "audio/Gain.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -203,6 +205,20 @@ bool JackEngine::Start(AudioHost* host)
 	const uint32_t block_size = MaxBlockSize();
 	outgoing_scratch_.assign(outputs_.size(), std::vector<float>(block_size, 0.0f));
 	incoming_scratch_.assign(outputs_.size(), std::vector<float>(block_size, 0.0f));
+	input_scratch_.assign(inputs_.size(), std::vector<float>(block_size, 0.0f));
+
+	// The tuner's two windows, allocated here with everything else the audio
+	// thread will touch -- it can allocate nothing itself.
+	tap_buffer_[0].assign(kInputTapSamples, 0.0f);
+	tap_buffer_[1].assign(kInputTapSamples, 0.0f);
+	tap_fill_ = 0;
+	tap_writing_ = 0;
+	tap_ready_.store(-1, std::memory_order_relaxed);
+
+	// The gate's coefficients are all times, so they need the sample rate --
+	// which is first known here, and again after a restart at a different one.
+	// Reset keeps the settings and clears only the runtime state.
+	gate_.Reset(SampleRate());
 
 	processing_.store(true, std::memory_order_release);
 
@@ -436,6 +452,11 @@ void JackEngine::ResizeScratch(uint32_t frames)
 	{
 		buffer.assign(frames, 0.0f);
 	}
+
+	for (std::vector<float>& buffer : input_scratch_)
+	{
+		buffer.assign(frames, 0.0f);
+	}
 }
 
 bool JackEngine::SetBufferSize(uint32_t frames)
@@ -594,6 +615,30 @@ bool JackEngine::SwapHost(AudioHost* next)
 	return true;
 }
 
+bool JackEngine::TakeInputWindow(float* out)
+{
+	const int ready = tap_ready_.load(std::memory_order_acquire);
+
+	if (ready < 0 || !out)
+	{
+		return false;
+	}
+
+	const std::vector<float>& from = tap_buffer_[static_cast<size_t>(ready)];
+
+	for (size_t i = 0; i < from.size(); ++i)
+	{
+		out[i] = from[i];
+	}
+
+	// Released only after the copy: this is what tells the audio thread the
+	// buffer is free again, and saying so early is saying it while the copy is
+	// still reading from it.
+	tap_ready_.store(-1, std::memory_order_release);
+
+	return true;
+}
+
 bool JackEngine::PopMidiEvent(MidiEvent& out)
 {
 	const size_t head = midi_head_.load(std::memory_order_relaxed);
@@ -658,6 +703,18 @@ int JackEngine::ProcessCallback(jack_nframes_t nframes, void* arg)
 	return static_cast<JackEngine*>(arg)->Process(nframes);
 }
 
+void JackEngine::SetInputGainDb(float db)
+{
+	input_gain_db_.store(db, std::memory_order_relaxed);
+	input_gain_.store(DbToLinear(db), std::memory_order_relaxed);
+}
+
+void JackEngine::SetOutputGainDb(float db)
+{
+	output_gain_db_.store(db, std::memory_order_relaxed);
+	output_gain_.store(DbToLinear(db), std::memory_order_relaxed);
+}
+
 int JackEngine::Process(jack_nframes_t nframes)
 {
 	// Parse incoming MIDI into the queue. Done first so an event and the
@@ -702,6 +759,13 @@ int JackEngine::Process(jack_nframes_t nframes)
 	// One acquire load per cycle: whichever host this sees, it uses for the
 	// whole callback. A swap published mid-cycle simply takes effect next
 	// time round.
+	// When this cycle started, for the DSP figure (SF-65). jack_get_time is the
+	// server's own monotonic microsecond clock: it is documented as callable
+	// from the process callback, it does not allocate, and it is what JACK
+	// measures itself with -- so this figure and jackd's own agree about what
+	// a microsecond is.
+	const jack_time_t started_us = jack_get_time();
+
 	AudioHost* host = host_.load(std::memory_order_acquire);
 
 	if (!host)
@@ -711,6 +775,11 @@ int JackEngine::Process(jack_nframes_t nframes)
 			float* buffer = static_cast<float*>(jack_port_get_buffer(binding.jack_port, nframes));
 			std::memset(buffer, 0, nframes * sizeof(float));
 		}
+
+		// Counted like any other cycle. An idle board reading 0% is the useful
+		// baseline; skipping these would leave the last real figure standing
+		// after the chain went away.
+		RecordDspLoad(started_us, nframes);
 
 		process_count_.fetch_add(1, std::memory_order_release);
 
@@ -723,9 +792,23 @@ int JackEngine::Process(jack_nframes_t nframes)
 	// fine.
 	float input_peak = 0.0f;
 
-	for (const AudioPortBinding& binding : inputs_)
+	// The input trim, ramped once for the whole block and then applied per
+	// channel, so a stereo pair walks the same ramp and stays coherent.
+	const float input_gain_target = input_gain_.load(std::memory_order_relaxed);
+
+	for (size_t k = 0; k < inputs_.size(); ++k)
 	{
-		float* buffer = static_cast<float*>(jack_port_get_buffer(binding.jack_port, nframes));
+		const AudioPortBinding& binding = inputs_[k];
+
+		const float* incoming_samples =
+			static_cast<const float*>(jack_port_get_buffer(binding.jack_port, nframes));
+
+		// Trimmed into scratch rather than in place: the port buffer belongs
+		// to the server and is ours to read only.
+		float* buffer = input_scratch_[k].data();
+
+		RampGain(buffer, incoming_samples, nframes, input_gain_applied_, input_gain_target);
+
 		host->ConnectAudioPort(binding.plugin_port_index, buffer);
 
 		if (incoming)
@@ -733,14 +816,78 @@ int JackEngine::Process(jack_nframes_t nframes)
 			incoming->ConnectAudioPort(binding.plugin_port_index, buffer);
 		}
 
-		// Measured before the chain runs, so this is what arrived from the
-		// interface -- the number that says whether the *guitar* is too hot,
-		// independently of what the plugins then do with it.
+		// Measured *after* the trim, so the meter shows what the chain is
+		// actually being fed. That is the reading the trim is set against --
+		// a meter that didn't move as you dragged the slider beside it would
+		// be useless for the one job it has here.
 		bool ignored = false;
 		input_peak = std::max(input_peak, BlockPeak(buffer, nframes, ignored));
 	}
 
+	input_gain_applied_ = input_gain_target;
+
 	RaisePeak(input_peak_, input_peak);
+
+	// The tuner's tap (SF-81). Channel 0 only: a tuner listens to the guitar,
+	// and summing a stereo input would fold two strings' worth of signal into
+	// one window for no gain.
+	//
+	// Filling stops the moment a window is complete and does not start again
+	// until the reader takes it. A tuner that overwrote the window it was
+	// being read from would hand over half of one and half of the next, and
+	// that is not noise -- it is a confident wrong note.
+	if (tap_enabled_.load(std::memory_order_relaxed) && !inputs_.empty() &&
+		tap_ready_.load(std::memory_order_acquire) < 0)
+	{
+		std::vector<float>& into = tap_buffer_[tap_writing_];
+		const float* source = input_scratch_[0].data();
+
+		const uint32_t room = static_cast<uint32_t>(into.size()) - tap_fill_;
+		const uint32_t take = std::min(room, nframes);
+
+		for (uint32_t i = 0; i < take; ++i)
+		{
+			into[tap_fill_ + i] = source[i];
+		}
+
+		tap_fill_ += take;
+
+		if (tap_fill_ >= into.size())
+		{
+			tap_ready_.store(static_cast<int>(tap_writing_), std::memory_order_release);
+
+			tap_writing_ = 1 - tap_writing_;
+			tap_fill_ = 0;
+		}
+	}
+
+	// The gate (SF-85), in place on the buffers the chain is about to read.
+	//
+	// **Here, and not in the loop above, for two reasons that are invisible
+	// once it works.** The input meter was measured before this point, so it
+	// keeps showing the *ungated* signal -- which matters because the meter is
+	// what the threshold is set against, and one that read silence exactly
+	// when you needed to see what you were cutting would be useless. And the
+	// tuner tapped before this point, so tuning is never gated: a quietly
+	// plucked string is precisely the signal a gate removes, and a tuner that
+	// went blank when the gate came up would be blamed on the tuner.
+	//
+	// No restructuring is needed to sit here because ConnectAudioPort above
+	// handed over a *pointer* to input_scratch_. Both hosts read these same
+	// buffers when they run, so one gate upstream serves a crossfade rather
+	// than two independent ones fighting inside it.
+	if (!input_scratch_.empty())
+	{
+		float* gated[2] = {nullptr, nullptr};
+		const unsigned count = static_cast<unsigned>(std::min<size_t>(input_scratch_.size(), 2));
+
+		for (unsigned k = 0; k < count; ++k)
+		{
+			gated[k] = input_scratch_[k].data();
+		}
+
+		gate_.Process(gated, count, nframes);
+	}
 
 	if (!incoming)
 	{
@@ -791,6 +938,40 @@ int JackEngine::Process(jack_nframes_t nframes)
 		}
 	}
 
+	// The output trim, before the mirrors copy and before the meter reads --
+	// so a mirrored channel carries the same level as the one it mirrors, and
+	// the meter and the clip light describe what actually leaves the machine.
+	//
+	// In place, unlike the input's: these buffers are ours to write.
+	const float output_gain_target = output_gain_.load(std::memory_order_relaxed);
+
+	for (const AudioPortBinding& binding : outputs_)
+	{
+		float* buffer = static_cast<float*>(jack_port_get_buffer(binding.jack_port, nframes));
+
+		RampGain(buffer, buffer, nframes, output_gain_applied_, output_gain_target);
+	}
+
+	output_gain_applied_ = output_gain_target;
+
+	// The click, **after the chain and after the trim** (SF-82). The board's
+	// gain staging therefore cannot change how loud it is -- a metronome that
+	// got quieter when you turned the amp down would be one more thing to
+	// fight mid-song -- and it can never reach the tuner, which listens to the
+	// input. Before the mirrors, so a mirrored channel carries it too.
+	if (metronome_)
+	{
+		float* left = outputs_.empty()
+			? nullptr
+			: static_cast<float*>(jack_port_get_buffer(outputs_[0].jack_port, nframes));
+
+		float* right = outputs_.size() > 1
+			? static_cast<float*>(jack_port_get_buffer(outputs_[1].jack_port, nframes))
+			: nullptr;
+
+		metronome_->Mix(left, right, nframes);
+	}
+
 	for (const MirrorBinding& mirror : mirrors_)
 	{
 		const float* source =
@@ -819,11 +1000,48 @@ int JackEngine::Process(jack_nframes_t nframes)
 		output_clips_.fetch_add(1, std::memory_order_relaxed);
 	}
 
+	RecordDspLoad(started_us, nframes);
+
 	// Release-ordered so a control thread that sees this count knows the
 	// work above (including any use of the previous host) has finished.
 	process_count_.fetch_add(1, std::memory_order_release);
 
 	return 0;
+}
+
+// How much of this block's time budget the callback just used, folded into a
+// running average (SF-65).
+//
+// Audio thread. Two clock reads, some arithmetic and a relaxed store -- no
+// allocation, no lock, no syscall beyond jack_get_time's clock read.
+void JackEngine::RecordDspLoad(uint64_t started_us, uint32_t nframes)
+{
+	const double rate = jack_get_sample_rate(client_);
+
+	if (rate <= 0.0 || nframes == 0)
+	{
+		return;
+	}
+
+	// What the block was worth in wall-clock time. This is the budget: spend
+	// longer than this and the next block is late.
+	const double budget_us = (static_cast<double>(nframes) / rate) * 1e6;
+	const double spent_us = static_cast<double>(jack_get_time() - started_us);
+
+	const float instant = static_cast<float>(spent_us / budget_us);
+
+	// A one-pole average. Without it the reading is unreadable: block times
+	// scatter by a factor of two from scheduling alone, and a gauge that
+	// flickers between 20% and 60% tells a player nothing. The coefficient is
+	// per block rather than per second, which means the smoothing is longer in
+	// wall-clock terms at a small buffer size -- correct, since that is also
+	// where the scatter is worst.
+	constexpr float kSmoothing = 0.05f;
+
+	const float previous = dsp_load_.load(std::memory_order_relaxed);
+	const float smoothed = previous + (instant - previous) * kSmoothing;
+
+	dsp_load_.store(std::isfinite(smoothed) ? smoothed : 0.0f, std::memory_order_relaxed);
 }
 
 }  // namespace sf

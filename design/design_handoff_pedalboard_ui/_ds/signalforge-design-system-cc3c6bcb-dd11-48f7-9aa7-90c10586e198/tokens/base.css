@@ -1,0 +1,4 @@
+html,body{background:var(--bg-app);color:var(--text-primary);font-family:var(--font-ui);font-size:var(--text-base);line-height:var(--leading-normal);margin:0;-webkit-font-smoothing:antialiased}
+a{color:var(--link);text-decoration:none}
+a:hover{color:var(--link-hover);text-decoration:underline}
+*{box-sizing:border-box}

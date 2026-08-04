@@ -178,6 +178,13 @@ void AudioConfig::Clamp()
 
 	sample_rate = std::min(kMaxSampleRate, std::max(kMinSampleRate, sample_rate));
 	buffer_size = std::min(kMaxBufferSize, std::max(kMinBufferSize, buffer_size));
+
+	// Anything but mono, stereo, or "auto" is a hand-edited file saying
+	// something this host can't do; auto is the reading that always works.
+	if (board_inputs > 2)
+	{
+		board_inputs = 0;
+	}
 }
 
 nlohmann::json AudioConfig::ToJson() const
@@ -189,6 +196,7 @@ nlohmann::json AudioConfig::ToJson() const
 		{"buffer_size", buffer_size},
 		{"input_ports", input_ports},
 		{"output_ports", output_ports},
+		{"board_inputs", board_inputs},
 		{"configured", configured},
 	};
 }
@@ -230,6 +238,11 @@ AudioConfig AudioConfig::FromJson(const nlohmann::json& json)
 	if (json.contains("output_ports") && json["output_ports"].is_string())
 	{
 		out.output_ports = json["output_ports"].get<std::string>();
+	}
+
+	if (json.contains("board_inputs") && json["board_inputs"].is_number_integer())
+	{
+		out.board_inputs = json["board_inputs"].get<unsigned>();
 	}
 
 	if (json.contains("configured") && json["configured"].is_boolean())

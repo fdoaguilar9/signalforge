@@ -24,6 +24,7 @@
 
 #include "app/Settings.h"
 #include "audio/AudioConfig.h"
+#include "audio/PitchDetect.h"
 #include "audio/Crossfade.h"
 #include "jack/JackEngine.h"
 #include "jack/JackServer.h"
@@ -33,6 +34,7 @@
 #include "midi/MidiMap.h"
 #include "offline/OfflineEngine.h"
 #include "preset/ChainPreset.h"
+#include "preset/SplitEdit.h"
 #include "preset/Preset.h"
 #include "preset/PresetLibrary.h"
 #include "lv2/PluginStage.h"
@@ -67,7 +69,8 @@ void PrintUsage(const char* argv0)
 		"           --run-chain <plugin-uri> [...] [--set-path stage-index:property-uri=file-path ...] |\n"
 		"           --test-chain {<plugin-uri> [...] | --preset <name|index|path> [--preset-dir <dir>]}\n"
 		"                        [--set-path stage:property-uri=file-path ...] [--control stage:symbol=value ...]\n"
-		"                        [--seconds N] [--block-size N] [--expect-signal] [--bypass <stage> ...] |\n"
+		"                        [--seconds N] [--block-size N] [--expect-signal] [--bypass <stage> ...]\n"
+		"                        [--lane-gain <a|b>=<dB> ...] [--board-inputs 1|2] |\n"
 		"           --save-preset <out.json> <plugin-uri> [...] [--set-path stage:property-uri=file-path ...]\n"
 		"                         [--control stage:symbol=value ...] [--name \"...\"]]\n",
 		argv0);
@@ -558,17 +561,19 @@ bool ResolvePreset(const std::string& query, const std::string& preset_dir, sf::
 		std::fprintf(stderr, "Warning: %s\n", warning.c_str());
 	}
 
-	size_t index = 0;
+	sf::PresetLibrary::Location at;
 
-	if (!library.Resolve(query, index))
+	if (!library.Resolve(query, at))
 	{
-		std::fprintf(stderr, "No preset matching '%s' in '%s' (%zu preset(s) available).\n", query.c_str(),
-			preset_dir.c_str(), library.Count());
+		std::fprintf(stderr, "No preset matching '%s' in '%s' (%zu bank(s) available).\n", query.c_str(),
+			preset_dir.c_str(), library.BankCount());
 		return false;
 	}
 
-	out = library.At(index).preset;
-	resolved_path = library.At(index).path;
+	const sf::PresetLibrary::Entry& entry = library.BankAt(at.bank).entries[at.index];
+
+	out = entry.preset;
+	resolved_path = entry.path;
 
 	return true;
 }
@@ -590,13 +595,20 @@ int ListPresets(const std::string& preset_dir)
 		std::fprintf(stderr, "Warning: %s\n", warning.c_str());
 	}
 
-	std::printf("%zu preset(s) in '%s':\n", library.Count(), preset_dir.c_str());
-
-	for (size_t i = 0; i < library.Count(); ++i)
+	// Listed bank by bank, since an index only means something within one and
+	// a flat list would imply otherwise.
+	for (size_t b = 0; b < library.BankCount(); ++b)
 	{
-		const sf::PresetLibrary::Entry& entry = library.At(i);
-		std::printf("  [%zu] %-24s %-24s %zu stage(s)\n", i, entry.stem.c_str(), entry.preset.name.c_str(),
-			entry.preset.chain.size());
+		const sf::PresetLibrary::Bank& bank = library.BankAt(b);
+
+		std::printf("%s (%zu preset(s)) -- %s\n", bank.name.c_str(), bank.entries.size(), bank.directory.c_str());
+
+		for (size_t i = 0; i < bank.entries.size(); ++i)
+		{
+			const sf::PresetLibrary::Entry& entry = bank.entries[i];
+			std::printf("  [%zu] %-24s %-24s %zu stage(s)\n", i, entry.stem.c_str(), entry.preset.name.c_str(),
+				entry.preset.graph.PluginCount());
+		}
 	}
 
 	return 0;
@@ -629,6 +641,75 @@ std::string DescribeMatcher(const sf::MidiBinding& binding)
 	return text;
 }
 
+// Whether an action is driven by a *value* -- a pedal sweeping a range -- as
+// opposed to a switch that just fires. The mappings table shows `--` for the
+// latter, which is a different thing from an unknown range.
+bool BindingTakesValue(sf::MidiAction action)
+{
+	switch (action)
+	{
+		case sf::MidiAction::SetControl:
+		case sf::MidiAction::SetInputGain:
+		case sf::MidiAction::SetOutputGain:
+		case sf::MidiAction::SetSplitterControl:
+		case sf::MidiAction::SetMixerLevel:
+		case sf::MidiAction::SetTempo:
+			return true;
+
+		case sf::MidiAction::LoadPreset:
+		case sf::MidiAction::NextPreset:
+		case sf::MidiAction::PrevPreset:
+		case sf::MidiAction::NextBank:
+		case sf::MidiAction::PrevBank:
+		case sf::MidiAction::ToggleBypass:
+		case sf::MidiAction::ToggleMetronome:
+			return false;
+	}
+
+	return false;
+}
+
+// What a binding points *at*, without repeating the action's own name or its
+// range -- the mappings table has columns for both of those (SF-78).
+std::string DescribeBindingTarget(const sf::MidiBinding& binding)
+{
+	switch (binding.action)
+	{
+		case sf::MidiAction::LoadPreset:
+			return binding.preset;
+
+		case sf::MidiAction::ToggleBypass:
+			return "stage " + std::to_string(binding.stage);
+
+		case sf::MidiAction::SetControl:
+			return "stage " + std::to_string(binding.stage) + " '" + binding.port + "'";
+
+		case sf::MidiAction::SetSplitterControl:
+		case sf::MidiAction::SetMixerLevel:
+			return "channel " + binding.port;
+
+		case sf::MidiAction::SetInputGain:
+			return "input trim";
+
+		case sf::MidiAction::SetOutputGain:
+			return "output trim";
+
+		case sf::MidiAction::SetTempo:
+		case sf::MidiAction::ToggleMetronome:
+			return "metronome";
+
+		// The action name already says the whole of it: "next_preset" has no
+		// target that "next preset" does not already name.
+		case sf::MidiAction::NextPreset:
+		case sf::MidiAction::PrevPreset:
+		case sf::MidiAction::NextBank:
+		case sf::MidiAction::PrevBank:
+			break;
+	}
+
+	return std::string();
+}
+
 std::string DescribeBinding(const sf::MidiBinding& binding)
 {
 	std::string text = sf::ToString(binding.action);
@@ -654,8 +735,32 @@ std::string DescribeBinding(const sf::MidiBinding& binding)
 			break;
 		}
 
+		case sf::MidiAction::SetSplitterControl:
+		case sf::MidiAction::SetMixerLevel:
+		{
+			char range[64];
+			std::snprintf(range, sizeof(range), "%g..%g", binding.minimum, binding.maximum);
+
+			text += " '" + binding.port + "' over " + range;
+			break;
+		}
+
+		case sf::MidiAction::SetInputGain:
+		case sf::MidiAction::SetOutputGain:
+		case sf::MidiAction::SetTempo:
+		{
+			char range[64];
+			std::snprintf(range, sizeof(range), "%g..%g", binding.minimum, binding.maximum);
+
+			text += std::string(" over ") + range;
+			break;
+		}
+
 		case sf::MidiAction::NextPreset:
 		case sf::MidiAction::PrevPreset:
+		case sf::MidiAction::NextBank:
+		case sf::MidiAction::PrevBank:
+		case sf::MidiAction::ToggleMetronome:
 			break;
 	}
 
@@ -669,7 +774,7 @@ std::string DescribeBinding(const sf::MidiBinding& binding)
 // the two consequences that aren't obvious from the plugin names alone --
 // saving would write the file without them, and a MIDI binding that names a
 // stage by number now counts a shorter chain.
-std::string DescribeMissingPlugins(const std::vector<std::string>& missing)
+std::string DescribeMissingPlugins(const std::vector<std::string>& missing, size_t collapsed_splits = 0)
 {
 	if (missing.empty())
 	{
@@ -685,6 +790,43 @@ std::string DescribeMissingPlugins(const std::vector<std::string>& missing)
 
 	text += ". The board is playing without them; saving is blocked so the preset keeps them, and any "
 			"stage-numbered MIDI binding now counts a shorter chain.";
+
+	// Which is a bigger change than a shorter chain, so it is said separately
+	// (SF-58): the shape of the board is not what the file describes any more.
+	if (collapsed_splits > 0)
+	{
+		text += collapsed_splits == 1
+			? " One split lost a whole channel and is playing as a series until its plugin is back."
+			: " " + std::to_string(collapsed_splits) +
+				" splits lost a whole channel and are playing as a series until their plugins are back.";
+	}
+
+	return text;
+}
+
+// The connected MIDI inputs as one short line for the sidebar (SF-69).
+//
+// JACK port names are "client:port", and the client is the part a player would
+// recognise -- "USB MIDI Interface" rather than the "midi_capture_1" beside
+// it. More than one connection is normal (an interface often presents several
+// ports), so the rest are counted rather than listed: the row is 330px wide
+// and the question it answers is "is anything plugged in".
+std::string DescribeMidiInputs(const std::vector<std::string>& ports)
+{
+	if (ports.empty())
+	{
+		return {};
+	}
+
+	const std::string& first = ports.front();
+	const size_t colon = first.find(':');
+
+	std::string text = colon == std::string::npos ? first : first.substr(0, colon);
+
+	if (ports.size() > 1)
+	{
+		text += " +" + std::to_string(ports.size() - 1);
+	}
 
 	return text;
 }
@@ -825,10 +967,103 @@ sf::Preset PresetWithAddedStage(
 	// plugin's author intended, not inherit anything from its neighbours.
 	sf::PresetStage added;
 	added.uri = plugin_uri;
-	edited.chain.push_back(added);
+	edited.graph.AppendPlugin(added);
 
 	return edited;
 }
+
+#ifdef SIGNALFORGE_GUI
+
+// The board's shape, as the view needs it: the same tree, with each plugin
+// node pointing at its stage in the running chain.
+//
+// The two are not in step whenever a plugin is missing -- the node is in the
+// preset and there is no stage for it -- which is exactly why the view is
+// given the mapping rather than being left to assume it.
+sf::BoardGraphNodes SnapshotGraph(const sf::ChainGraph& graph, const std::vector<size_t>& skipped)
+{
+	size_t flat = 0;
+	size_t stage = 0;
+
+	std::function<sf::BoardGraphNodes(const sf::NodeList&)> walk = [&](const sf::NodeList& nodes)
+	{
+		sf::BoardGraphNodes out;
+
+		for (const sf::GraphNode& node : nodes)
+		{
+			sf::BoardGraphNode board_node;
+			board_node.id = static_cast<sf::BoardNodeId>(node.id);
+
+			if (node.kind == sf::NodeKind::Split)
+			{
+				board_node.split = true;
+				board_node.branches.resize(2);
+
+				// Three enums that spell the same three modes, in three
+				// layers that deliberately don't know about each other. The
+				// translations are dull and they are the price of that.
+				switch (node.splitter.mode)
+				{
+					case sf::SplitterMode::Full:
+						board_node.splitter.mode = sf::BoardSplitterMode::Full;
+						break;
+
+					case sf::SplitterMode::Crossover:
+						board_node.splitter.mode = sf::BoardSplitterMode::Crossover;
+						break;
+
+					case sf::SplitterMode::Stereo:
+						board_node.splitter.mode = sf::BoardSplitterMode::Stereo;
+						break;
+				}
+
+				board_node.splitter.frequency = node.splitter.frequency;
+
+				for (unsigned b = 0; b < 2; ++b)
+				{
+					board_node.splitter.send_db[b] = node.splitter.send_db[b];
+
+					switch (node.splitter.source[b])
+					{
+						case sf::SplitterSource::Left:
+							board_node.splitter.source[b] = sf::BoardSplitterSource::Left;
+							break;
+
+						case sf::SplitterSource::Right:
+							board_node.splitter.source[b] = sf::BoardSplitterSource::Right;
+							break;
+
+						case sf::SplitterSource::Sum:
+							board_node.splitter.source[b] = sf::BoardSplitterSource::Sum;
+							break;
+					}
+				}
+
+				for (unsigned b = 0; b < 2 && b < node.branches.size(); ++b)
+				{
+					board_node.branches[b].gain_db = node.branches[b].gain_db;
+					board_node.branches[b].muted = node.branches[b].muted;
+					board_node.branches[b].nodes = walk(node.branches[b].nodes);
+				}
+
+				out.push_back(std::move(board_node));
+				continue;
+			}
+
+			const size_t position = flat++;
+			const bool missing = std::find(skipped.begin(), skipped.end(), position) != skipped.end();
+
+			board_node.stage = missing ? sf::kNoStageIndex : stage++;
+			out.push_back(std::move(board_node));
+		}
+
+		return out;
+	};
+
+	return walk(graph.Trunk());
+}
+
+#endif
 
 struct RunPresetOptions
 {
@@ -1258,6 +1493,24 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	// Before Start(), which is where the length becomes a per-sample step.
 	engine.SetCrossfade(settings.crossfade_ms, settings.crossfade_curve);
 
+	// The board-wide trims, restored from settings (SF-66). Set before the
+	// engine runs a block, so the first sound out is already at the level the
+	// player left it at rather than jumping there a frame later.
+	engine.SetInputGainDb(static_cast<float>(settings.input_gain_db));
+	engine.SetOutputGainDb(static_cast<float>(settings.output_gain_db));
+
+	// The click (SF-82). Declared here, beside the engine it is handed to: it
+	// is a control-thread object with settings a player changes, and jack/ has
+	// no business owning one -- the engine's job is only to give it somewhere
+	// to land, after the chain and after the trim.
+	//
+	// Its rate has to match the engine's, and both are settled before a block
+	// is processed.
+	sf::Metronome metronome;
+
+	metronome.SetSampleRate(engine.SampleRate());
+	engine.SetMetronome(&metronome);
+
 	sf::UridMap urid_map;
 	std::string error;
 
@@ -1267,12 +1520,26 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	// forgetting them is how they get saved away.
 	std::vector<std::string> missing_plugins;
 
+	// How many splits the degraded build collapsed (SF-58). Kept beside the
+	// missing list because it is part of the same sentence: what the board is
+	// playing instead of what the file says.
+	size_t collapsed_splits = 0;
+
+	// The flat positions those missing plugins occupy in the preset. Needed
+	// whenever the running chain is captured back into the board's shape:
+	// those nodes have no stage to read values from, and the file's own values
+	// are what must survive (SF-57).
+	std::vector<size_t> skipped_indices;
+
 	sf::ChainBuildReport build_report;
 
 	std::unique_ptr<sf::Chain> chain = sf::BuildChainFromPreset(
-		world, preset, engine.SampleRate(), engine.MaxBlockSize(), urid_map, error, &build_report);
+		world, preset, engine.SampleRate(), engine.MaxBlockSize(), urid_map, error, &build_report,
+		settings.audio.board_inputs);
 
 	missing_plugins = build_report.skipped_uris;
+	collapsed_splits = build_report.collapsed_splits;
+	skipped_indices = build_report.skipped_indices;
 
 	if (!chain)
 	{
@@ -1291,12 +1558,24 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		return 1;
 	}
 
+	// The first preset never goes through switch_to_preset, so its gate has to
+	// be pushed here or the board would come up ungated until the first
+	// switch (SF-85). After Start, because Start is where the gate learns the
+	// sample rate -- Reset keeps the settings, but pushing them afterwards is
+	// the order that reads as cause and effect.
+	engine.Gate().Set(preset.gate);
+
 	// SF-39, after Start(): that's where in_N/out_N are actually registered.
 	engine.ConnectAudioPorts(settings.audio.input_ports, settings.audio.output_ports);
 
+	// What is on the other end of midi_in, for the sidebar's Controller row
+	// (SF-69). Kept as the connection is made rather than asked for later:
+	// this is the only place that knows, and it changes only here.
+	std::string midi_controller;
+
 	if (options.connect_midi)
 	{
-		engine.ConnectMidiInputs(options.midi_device);
+		midi_controller = DescribeMidiInputs(engine.ConnectMidiInputs(options.midi_device));
 	}
 
 	std::printf("Running preset '%s' from %s (%zu stage(s)).\n", preset.name.c_str(), resolved_path.c_str(),
@@ -1307,7 +1586,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		// On stdout as well as the per-stage warnings on stderr: this is the
 		// line that says what it means for the board, and a headless run has
 		// no window to put it in.
-		std::printf("Warning: %s\n", DescribeMissingPlugins(missing_plugins).c_str());
+		std::printf("Warning: %s\n", DescribeMissingPlugins(missing_plugins, collapsed_splits).c_str());
 	}
 
 	std::printf("Commands: a preset name/index, \"next\", \"prev\", \"bypass <stage>\", \"status\",\n");
@@ -1349,47 +1628,125 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	// the file carries, starting with its MIDI trigger.
 	sf::Preset current_source = preset;
 
-	for (size_t i = 0; i < library.Count(); ++i)
+	// Which bank the resolved preset came from, so the board starts on the
+	// bank it is playing rather than on bank 0 with a selection that isn't in
+	// it (SF-67).
+	if (sf::PresetLibrary::Location at; library.FindByPath(resolved_path, at))
 	{
-		if (library.At(i).path == resolved_path)
-		{
-			current_index = i;
-			break;
-		}
+		library.SelectBank(at.bank);
+		current_index = at.index;
 	}
+
+	// What to write into settings so the next run comes back here. A bare stem
+	// for a preset in the Default bank -- which is what this always wrote, so
+	// a settings file from before banks still resolves -- and "bank/stem"
+	// otherwise.
+	auto remember_preset = [&library](const std::string& path)
+	{
+		if (sf::PresetLibrary::Location at; library.FindByPath(path, at))
+		{
+			return library.QualifiedName(at);
+		}
+
+		// Given as a path rather than out of the library. The stem is the best
+		// guess available and is what this did before banks existed.
+		return std::filesystem::path(path).stem().string();
+	};
 
 #ifdef SIGNALFORGE_GUI
-	// Flattened once, not per frame: the library doesn't change while the
-	// board is running, and a redraw has no business copying preset data out
-	// from under a switch that may be replacing it.
-	std::vector<sf::BoardPreset> board_presets;
-	board_presets.reserve(library.Count());
+	// The bank names. Flattened once: the set of banks doesn't change while
+	// the board is running, only which one is selected.
+	std::vector<std::string> board_banks;
+	board_banks.reserve(library.BankCount());
 
-	for (size_t i = 0; i < library.Count(); ++i)
+	for (size_t b = 0; b < library.BankCount(); ++b)
 	{
-		const sf::PresetLibrary::Entry& entry = library.At(i);
-
-		// Fall back to the filename when a preset has no name of its own, so
-		// the list never shows a blank row you can click but can't identify.
-		board_presets.push_back({entry.preset.name.empty() ? entry.stem : entry.preset.name, entry.stem});
+		board_banks.push_back(library.BankAt(b).name);
 	}
+
+	// The current bank's presets, flattened rather than read live: a redraw
+	// has no business copying preset data out from under a switch that may be
+	// replacing it.
+	//
+	// Rebuilt on a bank change rather than once at startup -- which is what
+	// makes this a lambda. The list is *the current bank*, so it is no more
+	// constant than the selection is.
+	std::vector<sf::BoardPreset> board_presets;
+
+	auto refresh_board_presets = [&]
+	{
+		board_presets.clear();
+		board_presets.reserve(library.Count());
+
+		for (size_t i = 0; i < library.Count(); ++i)
+		{
+			const sf::PresetLibrary::Entry& entry = library.At(i);
+
+			// Fall back to the filename when a preset has no name of its own,
+			// so the list never shows a blank row you can click but can't
+			// identify.
+			board_presets.push_back({entry.preset.name.empty() ? entry.stem : entry.preset.name, entry.stem});
+		}
+	};
+
+	refresh_board_presets();
 
 	// Rebuilt from scratch every frame. Each entry costs a lilv name lookup,
 	// which is microseconds against drawing a frame, and doing it live means
 	// bypass state can never be stale -- it also changes from MIDI and from
 	// the console, neither of which this code hears about.
 	std::vector<sf::BoardStage> board_stages;
+	sf::BoardGraphNodes board_graph;
 
 	// The message bound to each preset, and to stepping the library. Recomputed
 	// after a learn rather than every frame: the map only changes when someone
 	// binds something.
 	std::string next_binding;
 	std::string prev_binding;
+	std::string input_gain_binding;
+	std::string output_gain_binding;
+	std::string bank_binding;
+	std::string mixer_binding[2];
+	std::string metronome_binding;
+	std::string tempo_binding;
+
+	// The mappings table (SF-78), rendered from the same map the engine
+	// resolves against. Rebuilt here rather than per frame, and *only* here,
+	// so it cannot describe a map that no longer exists.
+	std::vector<sf::BoardMidiBinding> board_midi_map;
 
 	auto refresh_bindings = [&]
 	{
+		board_midi_map.clear();
+
+		for (const sf::MidiBinding& binding : midi_map.Bindings())
+		{
+			sf::BoardMidiBinding row;
+			row.message = DescribeMatcher(binding);
+			row.action = sf::ToString(binding.action);
+			row.target = DescribeBindingTarget(binding);
+
+			if (BindingTakesValue(binding.action))
+			{
+				char range[64];
+				std::snprintf(range, sizeof(range), "%g..%g", static_cast<double>(binding.minimum),
+					static_cast<double>(binding.maximum));
+
+				row.range = range;
+			}
+
+			board_midi_map.push_back(std::move(row));
+		}
+
 		next_binding.clear();
 		prev_binding.clear();
+		input_gain_binding.clear();
+		output_gain_binding.clear();
+		bank_binding.clear();
+		mixer_binding[0].clear();
+		mixer_binding[1].clear();
+		metronome_binding.clear();
+		tempo_binding.clear();
 
 		for (sf::BoardPreset& entry : board_presets)
 		{
@@ -1406,6 +1763,36 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 
 				case sf::MidiAction::PrevPreset:
 					prev_binding = DescribeMatcher(binding);
+					break;
+
+				case sf::MidiAction::NextBank:
+					bank_binding = DescribeMatcher(binding);
+					break;
+
+				case sf::MidiAction::SetInputGain:
+					input_gain_binding = DescribeMatcher(binding);
+					break;
+
+				case sf::MidiAction::SetOutputGain:
+					output_gain_binding = DescribeMatcher(binding);
+					break;
+
+				case sf::MidiAction::ToggleMetronome:
+					metronome_binding = DescribeMatcher(binding);
+					break;
+
+				case sf::MidiAction::SetTempo:
+					tempo_binding = DescribeMatcher(binding);
+					break;
+
+				case sf::MidiAction::SetMixerLevel:
+					// A mapping file is hand-editable, so `port` is whatever
+					// someone typed. Anything but a lane name is ignored here
+					// rather than guessed at -- it will not fire either.
+					if (binding.port == "a" || binding.port == "b")
+					{
+						mixer_binding[binding.port == "a" ? 0 : 1] = DescribeMatcher(binding);
+					}
 					break;
 
 				case sf::MidiAction::LoadPreset:
@@ -1442,6 +1829,11 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		std::string name;
 		std::string uri;
 		std::vector<sf::BoardPathProperty> paths;
+
+		// Whether the plugin ships its own editor (SF-79). Cached with the
+		// rest: answering it re-reads the plugin's TTL, which is the whole
+		// reason this struct exists.
+		bool has_custom_ui = false;
 	};
 
 	std::vector<StageStatics> stage_statics;
@@ -1463,6 +1855,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				StageStatics statics;
 				statics.name = stage->Name();
 				statics.uri = stage->Uri();
+				statics.has_custom_ui = stage->HasCustomUi();
 
 				for (const sf::PathProperty& property : stage->PathProperties())
 				{
@@ -1491,6 +1884,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 			entry.name = stage_statics[i].name;
 			entry.uri = stage_statics[i].uri;
 			entry.paths = stage_statics[i].paths;
+			entry.has_custom_ui = stage_statics[i].has_custom_ui;
 			entry.bypassed = stage->IsBypassed();
 
 			for (const sf::PortInfo& port : stage->Ports())
@@ -1606,6 +2000,24 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	std::sort(board_plugins.begin(), board_plugins.end(),
 		[](const sf::BoardPlugin& a, const sf::BoardPlugin& b) { return a.name < b.name; });
 
+	// The tuner's own state (SF-81), which lives here rather than in the view
+	// because most of it is about the *engine*: the tap is on, the board is
+	// muted, and this is what it was before.
+	// Tap tempo, averaged over the last few taps on the control thread and
+	// written across as one number. Four taps is three intervals, which is
+	// enough to reject one clumsy one without making the player keep tapping.
+	std::vector<uint64_t> taps;
+
+	sf::BoardTuner tuner_reading;
+	std::vector<float> tuner_window(sf::JackEngine::kInputTapSamples, 0.0f);
+	bool tuner_was_open = false;
+	float output_gain_before_tuner = 0.0f;
+
+	// Far enough down to be silence at any listening level. Not -INFINITY: the
+	// trim is ramped across a block when it changes (SF-66), and ramping
+	// toward negative infinity is not a ramp.
+	constexpr float kMutedDb = -90.0f;
+
 	// Whether the running chain has drifted from the file it came from.
 	bool unsaved_changes = false;
 	std::string ui_status;
@@ -1674,7 +2086,8 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		sf::ChainBuildReport report;
 
 		std::unique_ptr<sf::Chain> next_chain = sf::BuildChainFromPreset(
-			world, next_preset, engine.SampleRate(), engine.MaxBlockSize(), urid_map, error, &report);
+			world, next_preset, engine.SampleRate(), engine.MaxBlockSize(), urid_map, error, &report,
+			settings.audio.board_inputs);
 
 		const auto build_ms =
 			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - build_start)
@@ -1719,13 +2132,28 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		current_path = next_path;
 		current_source = next_preset;
 
+		// The gate is per preset, so a switch carries it across (SF-85).
+		// Outside any GUI guard: a headless board gates too.
+		//
+		// **Settings only -- never a Reset.** Reset clears the envelope and the
+		// gain, which would drop the signal mid-block and click on every preset
+		// change. The gate deliberately does not know a switch happened; it
+		// carries its envelope through one exactly as the crossfade carries the
+		// audio.
+		engine.Gate().Set(current_source.gate);
+
 		if (from_file)
 		{
 			missing_plugins = report.skipped_uris;
+			collapsed_splits = report.collapsed_splits;
+			skipped_indices = report.skipped_indices;
 
 			// The stem, not the path: presets get moved between directories
 			// with --preset-dir, and the name is the part that survives it.
-			settings.last_preset = std::filesystem::path(current_path).stem().string();
+			// Qualified with the bank when there is one, since a bare stem
+			// stops being unique the moment a second bank holds one like it
+			// (SF-67).
+			settings.last_preset = remember_preset(current_path);
 			save_settings();
 		}
 
@@ -1751,18 +2179,60 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 
 		// Match on the resolved path rather than the query, so stepping still
 		// works after a switch requested by name, index, or file path alike.
+		// A preset in another bank brings the bank selection with it -- the
+		// board has to be standing where it is playing, or the next stomp on
+		// "next preset" would leap somewhere unrelated.
 		size_t next_index = library.Count();
 
-		for (size_t i = 0; i < library.Count(); ++i)
+		if (sf::PresetLibrary::Location at; library.FindByPath(next_path, at))
 		{
-			if (library.At(i).path == next_path)
-			{
-				next_index = i;
-				break;
-			}
+			library.SelectBank(at.bank);
+			next_index = at.index;
 		}
 
 		return switch_to_preset(next_preset, next_path, next_index);
+	};
+
+	// next_bank / prev_bank. Lands on the new bank's first preset, because a
+	// bank is a set of sounds rather than a position -- there is no
+	// "corresponding" preset in the bank you have just stepped into.
+	auto step_bank = [&](int delta)
+	{
+		const size_t count = library.BankCount();
+
+		if (count < 2)
+		{
+			std::fprintf(stderr, "Only one bank in '%s' -- nothing to step to.\n", preset_dir.c_str());
+			return false;
+		}
+
+		const size_t previous = library.CurrentBank();
+		const size_t next = (previous + count + delta) % count;
+
+		if (!library.SelectBank(next) || library.Count() == 0)
+		{
+			library.SelectBank(previous);
+			return false;
+		}
+
+		if (!switch_to_preset(library.At(0).preset, library.At(0).path, 0))
+		{
+			library.SelectBank(previous);
+			return false;
+		}
+
+#ifdef SIGNALFORGE_GUI
+		// The sidebar's preset list is the current bank's, so a bank stepped
+		// into from a footswitch has to redraw it -- otherwise the board is
+		// playing one bank and listing another.
+		refresh_board_presets();
+		refresh_bindings();
+#endif
+
+		std::printf("Bank '%s'.\n", library.CurrentBankName().c_str());
+		std::fflush(stdout);
+
+		return true;
 	};
 
 	// next_preset / prev_preset. Wraps around, because a player stepping past
@@ -1825,11 +2295,20 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 			// A plugin instance is instantiated at a fixed sample rate; if the
 			// new server runs at a different one, the running chain is no
 			// longer valid and has to be rebuilt rather than just re-hosted.
-			if (std::fabs(engine.SampleRate() - chain_sample_rate) > 0.5)
+			//
+			// How wide the board's input is has the same consequence for a
+			// different reason (SF-76): it is planned into the chain, and the
+			// engine registers one JACK port per chain input, so a board that
+			// went from mono to stereo has to be re-planned before it is
+			// started or it will come up with the port count it had before.
+			const bool width_changed = config.board_inputs != settings.audio.board_inputs;
+
+			if (std::fabs(engine.SampleRate() - chain_sample_rate) > 0.5 || width_changed)
 			{
 				sf::ChainBuildReport report;
 				std::unique_ptr<sf::Chain> rebuilt = sf::BuildChainFromPreset(
-					world, current_source, engine.SampleRate(), engine.MaxBlockSize(), urid_map, reason, &report);
+					world, current_source, engine.SampleRate(), engine.MaxBlockSize(), urid_map, reason, &report,
+					config.board_inputs);
 
 				if (!rebuilt)
 				{
@@ -1841,6 +2320,9 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				chain = std::move(rebuilt);
 				chain_sample_rate = engine.SampleRate();
 				missing_plugins = report.skipped_uris;
+				collapsed_splits = report.collapsed_splits;
+			collapsed_splits = report.collapsed_splits;
+				skipped_indices = report.skipped_indices;
 #ifdef SIGNALFORGE_GUI
 				stage_statics_valid = false;
 #endif
@@ -1858,7 +2340,9 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 
 			if (options.connect_midi)
 			{
-				engine.ConnectMidiInputs(options.midi_device);
+				// The ports are registered again on the far side of a restart,
+				// so what is connected has to be read again with them.
+				midi_controller = DescribeMidiInputs(engine.ConnectMidiInputs(options.midi_device));
 			}
 
 			settings.audio = config;
@@ -2008,6 +2492,79 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 					stage->SetControl(binding.port, invocation.control_value);
 				}
 				break;
+
+			// The board-wide trims (SF-66). Quiet for the same reason as
+			// SetControl, and they update `settings` so a pedal-set level is
+			// still there next time the board comes up.
+			case sf::MidiAction::SetInputGain:
+				settings.input_gain_db = invocation.control_value;
+				engine.SetInputGainDb(invocation.control_value);
+				break;
+
+			case sf::MidiAction::SetOutputGain:
+				settings.output_gain_db = invocation.control_value;
+				engine.SetOutputGainDb(invocation.control_value);
+				break;
+
+			case sf::MidiAction::NextBank:
+				step_bank(1);
+				break;
+
+			case sf::MidiAction::PrevBank:
+				step_bank(-1);
+				break;
+
+			// A lane's level into the merge (SF-72). Quiet, and live: it goes
+			// to the running chain rather than through a rebuild, which is
+			// what makes it usable from a pedal at all.
+			//
+			// The board draws one split, so this is that split -- the first
+			// one on the trunk, which is merge 0. A binding that named a node
+			// would mean a different node in the next preset.
+			case sf::MidiAction::SetMixerLevel:
+			{
+				if (binding.port != "a" && binding.port != "b")
+				{
+					break;
+				}
+
+				const unsigned lane = binding.port == "a" ? 0 : 1;
+
+				for (sf::GraphNode& node : current_source.graph.Trunk())
+				{
+					if (node.kind != sf::NodeKind::Split || lane >= node.branches.size())
+					{
+						continue;
+					}
+
+					sf::GraphBranch& branch = node.branches[lane];
+					branch.gain_db = invocation.control_value;
+
+					chain->SetMergeGain(0, lane, branch.muted ? 0.0f : sf::GainFromDb(branch.gain_db));
+					unsaved_changes = true;
+					break;
+				}
+
+				break;
+			}
+
+			// The metronome (SF-82). Both are plain setters on an object the
+			// audio thread reads through atomics: no rebuild, nothing to
+			// schedule, and safe to drive as fast as a pedal sends.
+			case sf::MidiAction::SetTempo:
+				metronome.SetTempo(invocation.control_value);
+				break;
+
+			case sf::MidiAction::ToggleMetronome:
+				metronome.SetRunning(!metronome.Running());
+				break;
+
+			// Bound and persisted, but nothing to drive yet: the splitter's
+			// own MIDI control arrives with the send/frequency bindings.
+			// Listed rather than left to a default so that adding an action
+			// and forgetting to handle it here stays visible.
+			case sf::MidiAction::SetSplitterControl:
+				break;
 		}
 	};
 
@@ -2021,36 +2578,192 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	// The edit is applied to a snapshot of the *running* chain rather than to
 	// the file it came from, so a knob moved by hand or by an expression pedal
 	// survives having a stage reordered underneath it.
-	auto apply_stage_edit = [&](sf::StageEdit edit, size_t index)
+	auto apply_graph_edit = [&](const sf::BoardViewState& view, const std::string& insert_uri)
 	{
-		sf::Preset edited = sf::CaptureChainPreset(*chain, urid_map, current_name);
+		// Applied to the board's *shape* with the running chain's values read
+		// back into it -- so a knob moved by hand or by an expression pedal
+		// survives having a pedal moved underneath it, and a split survives
+		// being edited at all. Capturing the chain on its own would flatten
+		// every lane into the trunk.
+		sf::Preset edited = sf::CaptureChainPresetInto(current_source, *chain, urid_map, skipped_indices);
 
-		if (index >= edited.chain.size())
+		const auto node = static_cast<sf::NodeId>(view.graph_edit_node);
+
+		sf::GraphPosition at;
+		at.split = static_cast<sf::NodeId>(view.graph_edit_slot.split);
+		at.branch = view.graph_edit_slot.branch;
+		at.index = view.graph_edit_slot.index;
+
+		std::string edit_error;
+		bool applied = false;
+		sf::NodeId added = sf::kNoNode;
+
+		switch (view.graph_edit)
 		{
-			return;
-		}
+			case sf::GraphEdit::InsertPlugin:
+			{
+				// A new pedal arrives empty: inheriting a neighbour's controls
+				// would be bad enough, and inheriting its state would carry
+				// over another plugin's loaded model.
+				sf::PresetStage stage;
+				stage.uri = insert_uri;
 
-		switch (edit)
-		{
-			case sf::StageEdit::MoveUp:
-				std::swap(edited.chain[index - 1], edited.chain[index]);
+				applied = edited.graph.InsertPlugin(at, stage, added, edit_error);
+				break;
+			}
+
+			case sf::GraphEdit::InsertSplit:
+			{
+				// Going back to two channels puts the pedals back where they
+				// were, if this board has been here before (SF-86). Only when
+				// the restore finds nothing left of the old layout does this
+				// fall through to a plain empty split.
+				if (RestoreSplit(edited.graph, edited.collapsed_split, edit_error))
+				{
+					// Spent. Leaving it would mean a *second* collapse and
+					// expand restored a layout two edits stale.
+					edited.collapsed_split = sf::RememberedSplit();
+					applied = true;
+					break;
+				}
+
+				edit_error.clear();
+				applied = edited.graph.InsertSplit(at, added, edit_error);
+				break;
+			}
+
+			case sf::GraphEdit::Remove:
+				applied = edited.graph.Remove(node, edit_error);
 				break;
 
-			case sf::StageEdit::MoveDown:
-				std::swap(edited.chain[index], edited.chain[index + 1]);
+			case sf::GraphEdit::MoveEarlier:
+				applied = edited.graph.Move(node, -1, edit_error);
 				break;
 
-			case sf::StageEdit::Remove:
-				edited.chain.erase(edited.chain.begin() + static_cast<long>(index));
+			case sf::GraphEdit::MoveLater:
+				applied = edited.graph.Move(node, 1, edit_error);
 				break;
+
+			case sf::GraphEdit::Rejoin:
+			{
+				// Collapsing records which channel every pedal was on, so the
+				// trip back is a restoration rather than a fresh start.
+				applied = RejoinSplit(edited.graph, node, &edited.collapsed_split, edit_error);
+
+				if (!applied)
+				{
+					edited.collapsed_split = sf::RememberedSplit();
+				}
+
+				break;
+			}
+
+			// Mute stays a rebuild, unlike the level beside it (SF-72): it is
+			// one edit rather than a stream of them, and going through the
+			// rebuild path means it crossfades instead of stepping a lane to
+			// silence at a block boundary.
+			// The whole splitter at once (SF-75). Every field of it is planned
+			// into the chain, so this costs the same rebuild whichever one
+			// moved -- and a mode plus the setting that makes it mean
+			// something are usually chosen together.
+			case sf::GraphEdit::SetSplitter:
+			{
+				sf::GraphNode* split = edited.graph.Find(node);
+
+				if (split && split->kind == sf::NodeKind::Split)
+				{
+					sf::Splitter& splitter = split->splitter;
+
+					switch (view.graph_edit_splitter.mode)
+					{
+						case sf::BoardSplitterMode::Full:
+							splitter.mode = sf::SplitterMode::Full;
+							break;
+
+						case sf::BoardSplitterMode::Crossover:
+							splitter.mode = sf::SplitterMode::Crossover;
+							break;
+
+						case sf::BoardSplitterMode::Stereo:
+							splitter.mode = sf::SplitterMode::Stereo;
+							break;
+					}
+
+					// Clamped rather than refused: the slider cannot produce
+					// anything out of range, so a value that is means the
+					// caller has a bug, and taking the board away is a poor
+					// way to report one.
+					splitter.frequency = std::min(std::max(view.graph_edit_splitter.frequency, 1.0f), 40000.0f);
+
+					for (unsigned b = 0; b < 2; ++b)
+					{
+						splitter.send_db[b] = view.graph_edit_splitter.send_db[b];
+
+						switch (view.graph_edit_splitter.source[b])
+						{
+							case sf::BoardSplitterSource::Left:
+								splitter.source[b] = sf::SplitterSource::Left;
+								break;
+
+							case sf::BoardSplitterSource::Right:
+								splitter.source[b] = sf::SplitterSource::Right;
+								break;
+
+							case sf::BoardSplitterSource::Sum:
+								splitter.source[b] = sf::SplitterSource::Sum;
+								break;
+						}
+					}
+
+					applied = true;
+				}
+				else
+				{
+					edit_error = "that split is no longer there";
+				}
+
+				break;
+			}
+
+			case sf::GraphEdit::ToggleMute:
+			{
+				sf::GraphNode* split = edited.graph.Find(node);
+
+				if (split && split->kind == sf::NodeKind::Split && view.graph_edit_branch < split->branches.size())
+				{
+					sf::GraphBranch& lane = split->branches[view.graph_edit_branch];
+					lane.muted = !lane.muted;
+
+					applied = true;
+				}
+				else
+				{
+					edit_error = "that lane is no longer there";
+				}
+
+				break;
+			}
 
 			default:
 				return;
 		}
 
+		if (!applied)
+		{
+			// Refusing at either end of a lane is a no-op, not news. Anything
+			// else is worth saying: a rejoin that found no split, an insert
+			// into a lane that has gone.
+			if (!edit_error.empty() && edit_error != "already first" && edit_error != "already last")
+			{
+				ui_status = "Could not apply that change: " + edit_error;
+			}
+
+			return;
+		}
+
 		// A refused rebuild leaves the running chain untouched, which is the
-		// behaviour that matters: adjacent stages have to agree on channel
-		// counts, and not every order of a given set of plugins does.
+		// behaviour that matters: not every arrangement of a given set of
+		// plugins is one this host can wire up.
 		if (!switch_to_preset(edited, current_path, current_index, false))
 		{
 			ui_status = "Could not apply that change: " + error;
@@ -2099,16 +2812,16 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		// too, so this is the second line of defence.
 		if (!missing_plugins.empty())
 		{
-			ui_status = "Not saving: " + DescribeMissingPlugins(missing_plugins);
+			ui_status = "Not saving: " + DescribeMissingPlugins(missing_plugins, collapsed_splits);
 			std::fprintf(stderr, "%s\n", ui_status.c_str());
 			return;
 		}
 
-		sf::Preset snapshot = sf::CaptureChainPreset(*chain, urid_map, current_name);
-
-		// The chain comes from what's running; everything else comes from the
-		// file, because a capture has no way to know about it.
-		snapshot.midi_trigger = current_source.midi_trigger;
+		// Into the board's own shape, not a fresh flat one: a capture of the
+		// running chain alone knows nothing about splits, and saving one would
+		// quietly straighten every lane out into the trunk.
+		sf::Preset snapshot = sf::CaptureChainPresetInto(current_source, *chain, urid_map, skipped_indices);
+		snapshot.name = current_name;
 
 		std::string save_error;
 
@@ -2444,6 +3157,9 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 			view.sample_rate = engine.SampleRate();
 			view.block_size = engine.MaxBlockSize();
 			view.latency_ms = engine.RoundTripLatencyMs();
+			view.dsp_load = engine.DspLoad();
+			view.input_gain_db = engine.InputGainDb();
+			view.output_gain_db = engine.OutputGainDb();
 
 			// Meter ballistics. The peaks come back as "loudest since you
 			// last looked" and are reset by the read, so a bar driven
@@ -2479,12 +3195,16 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 			}
 
 			view.midi_drops = reported_midi_drops;
-			view.midi_bindings = midi_map.Size();
+			// The sidebar's figure and the mappings table are one list counted
+			// twice, and SF-78 asks that they agree. Taken from the rendered
+			// rows rather than from the map, so they cannot: a row the table
+			// declined to render is a binding the sidebar must not claim.
+			view.midi_bindings = board_midi_map.size();
 			view.presets = &board_presets;
 			view.current_preset = current_index < library.Count() ? current_index : sf::kNoPreset;
 			view.unsaved_changes = unsaved_changes;
 			view.status = ui_status;
-			view.warning = DescribeMissingPlugins(missing_plugins);
+			view.warning = DescribeMissingPlugins(missing_plugins, collapsed_splits);
 			view.save_blocked_reason = missing_plugins.empty()
 				? std::string()
 				: "Saving would write this preset without its missing stage(s). Install the plugin(s), or edit the "
@@ -2492,10 +3212,61 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 
 			snapshot_stages();
 			view.stages = &board_stages;
+
+			// Rebuilt every frame from the preset the chain was built from --
+			// the shape lives there, not in the running chain, which is a flat
+			// list of stages and could never say where a lane was.
+			board_graph = SnapshotGraph(current_source.graph, skipped_indices);
+			view.graph = &board_graph;
+
+			view.input_routing = settings.audio.input_ports;
+			view.output_routing = settings.audio.output_ports;
 			view.plugins = &board_plugins;
 			view.plugins_hidden = hidden_plugins;
 			view.next_binding = next_binding;
 			view.prev_binding = prev_binding;
+			view.input_gain_binding = input_gain_binding;
+			view.output_gain_binding = output_gain_binding;
+			view.bank_binding = bank_binding;
+			view.mixer_binding[0] = mixer_binding[0];
+			view.mixer_binding[1] = mixer_binding[1];
+			view.midi_controller = midi_controller;
+			view.midi_map = &board_midi_map;
+			view.tuner = tuner_reading;
+
+			// **The settings come from the preset, the gain from the engine.**
+			// Reading the settings back from the engine would be reading a
+			// copy: `current_source` is what a save writes out, so it has to
+			// be the value, and the engine only ever a sink for it.
+			view.gate.enabled = current_source.gate.enabled;
+			view.gate.threshold_db = current_source.gate.threshold_db;
+			view.gate.release_ms = current_source.gate.release_ms;
+			view.gate.gain = engine.Gate().Gain();
+
+			view.metronome.running = metronome.Running();
+			view.metronome.tempo = metronome.Tempo();
+			view.metronome.beats_per_bar = metronome.BeatsPerBar();
+			view.metronome.level = metronome.Level();
+			view.metronome.beat = metronome.CurrentBeat();
+			view.metronome.binding = metronome_binding;
+			view.metronome.tempo_binding = tempo_binding;
+
+			// What the board is *actually* taking in, not what was configured:
+			// `kAutoBoardInputs` means "as many as the first pedal wants", and
+			// the splitter card's stereo caveat is about the real number.
+			view.board_inputs = static_cast<unsigned>(chain->Ports().empty() ? 1 : 0);
+
+			for (const sf::PortInfo& port : chain->Ports())
+			{
+				if (port.type == sf::PortType::Audio && port.direction == sf::PortDirection::Input)
+				{
+					++view.board_inputs;
+				}
+			}
+
+			view.bank_name = library.CurrentBankName();
+			view.banks = &board_banks;
+			view.current_bank = library.CurrentBank();
 			view.learning = midi_learn.Armed();
 			view.learning_what = midi_learn.Armed() ? DescribeBinding(midi_learn.Target()) : std::string();
 
@@ -2511,6 +3282,167 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 			view.file_entries = &file_entries;
 
 			sf::DrawBoard(view, view_ui);
+
+			// The mappings modal reads a list and changes nothing, so opening
+			// it is the whole of what the caller has to do.
+			if (view.midi_map_requested)
+			{
+				view_ui.midi_map_open = true;
+			}
+
+			// The tuner is not like that: opening it **mutes the board**, and
+			// the mute is the output trim from SF-66 rather than a second way
+			// of silencing things. One thing that can take the sound away is
+			// one thing to check when it does not come back.
+			if (view.tuner_requested)
+			{
+				view_ui.tuner_open = true;
+			}
+
+			if (view.metronome_requested)
+			{
+				view_ui.metronome_open = true;
+			}
+
+			// The gate (SF-85). Written to the preset, then pushed to the
+			// engine -- in that order and never the other way round. If the
+			// engine were the value, `CaptureChainPresetInto` would snapshot a
+			// stale `current_source.gate` and a save would silently throw the
+			// change away.
+			//
+			// No rebuild: these are atomics the audio thread reads, so the
+			// sliders report continuously and are heard immediately.
+			{
+				bool gate_changed = false;
+
+				if (view.gate_toggle_requested)
+				{
+					current_source.gate.enabled = !current_source.gate.enabled;
+					gate_changed = true;
+				}
+
+				if (!std::isnan(view.gate_threshold_request))
+				{
+					current_source.gate.threshold_db = view.gate_threshold_request;
+					gate_changed = true;
+				}
+
+				if (!std::isnan(view.gate_release_request))
+				{
+					current_source.gate.release_ms = view.gate_release_request;
+					gate_changed = true;
+				}
+
+				if (gate_changed)
+				{
+					engine.Gate().Set(current_source.gate);
+					unsaved_changes = true;
+				}
+			}
+
+			// The metronome's controls. Each is a plain setter on an object
+			// the audio thread reads through atomics -- no rebuild, no
+			// crossfade, nothing to schedule.
+			if (view.metronome_toggle_requested)
+			{
+				metronome.SetRunning(!metronome.Running());
+			}
+
+			if (!std::isnan(view.metronome_tempo_request))
+			{
+				metronome.SetTempo(view.metronome_tempo_request);
+			}
+
+			if (!std::isnan(view.metronome_level_request))
+			{
+				metronome.SetLevel(view.metronome_level_request);
+			}
+
+			if (view.metronome_beats_request > 0)
+			{
+				metronome.SetBeatsPerBar(view.metronome_beats_request);
+			}
+
+			if (view.metronome_tap_requested)
+			{
+				const uint64_t now_ms = static_cast<uint64_t>(
+					std::chrono::duration_cast<std::chrono::milliseconds>(
+						std::chrono::steady_clock::now() - start_time)
+						.count());
+
+				// A gap this long is a new count, not a slow beat: 40 BPM is
+				// 1500 ms, and anything slower than that is someone coming
+				// back to the button rather than keeping time with it.
+				if (!taps.empty() && now_ms - taps.back() > 2000)
+				{
+					taps.clear();
+				}
+
+				taps.push_back(now_ms);
+
+				if (taps.size() > 4)
+				{
+					taps.erase(taps.begin());
+				}
+
+				if (taps.size() >= 2)
+				{
+					const double span = static_cast<double>(taps.back() - taps.front());
+					const double average = span / static_cast<double>(taps.size() - 1);
+
+					if (average > 0.0)
+					{
+						metronome.SetTempo(static_cast<float>(60000.0 / average));
+					}
+				}
+			}
+
+			if (view_ui.tuner_open != tuner_was_open)
+			{
+				tuner_was_open = view_ui.tuner_open;
+
+				engine.SetInputTapEnabled(view_ui.tuner_open);
+
+				if (view_ui.tuner_open)
+				{
+					// Remembered rather than recomputed on close: the trim is
+					// a setting a player chose, and coming back to 0 dB
+					// instead of to what it was would be the tuner quietly
+					// changing the board.
+					output_gain_before_tuner = settings.output_gain_db;
+					engine.SetOutputGainDb(kMutedDb);
+				}
+				else
+				{
+					engine.SetOutputGainDb(output_gain_before_tuner);
+					tuner_reading = sf::BoardTuner();
+				}
+			}
+
+			// Pitch detection runs here, on the control thread, over a copy of
+			// what the audio thread heard -- it walks the window once per
+			// candidate lag, which is far too much work for a process
+			// callback. Most frames there is no new window and this does
+			// nothing: a window is 4096 samples and a frame is 16 ms.
+			if (view_ui.tuner_open && engine.TakeInputWindow(tuner_window.data()))
+			{
+				const sf::PitchReading pitch = sf::DetectPitch(
+					tuner_window.data(), static_cast<uint32_t>(tuner_window.size()), engine.SampleRate());
+
+				if (pitch.frequency_hz > 0.0f)
+				{
+					const sf::NoteReading note = sf::DescribeNote(pitch.frequency_hz);
+
+					tuner_reading.note = note.name + std::to_string(note.octave);
+					tuner_reading.frequency_hz = pitch.frequency_hz;
+					tuner_reading.cents = note.cents;
+					tuner_reading.heard = true;
+				}
+
+				// A window with nothing in it leaves the display alone. A
+				// tuner that blanked every time a string decayed would go
+				// blank at exactly the moment it is being read.
+			}
 
 			if (view.audio_settings_requested)
 			{
@@ -2539,6 +3471,15 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				audio_settings_view.input_filter = settings.audio.input_ports;
 				audio_settings_view.output_filter = settings.audio.output_ports;
 				audio_settings_view.selected_device = -1;
+
+				// The config's `0` means "as many as the first pedal wants",
+				// which is a reasonable thing for a file to say and not a
+				// state a two-item control can show. The dialog opens on what
+				// the board is *actually* taking, so what it offers to change
+				// is the truth rather than the shorthand.
+				audio_settings_view.board_inputs = settings.audio.board_inputs != 0
+					? settings.audio.board_inputs
+					: std::max(1u, view.board_inputs);
 
 				for (size_t i = 0; i < audio_settings_devices.size(); ++i)
 				{
@@ -2577,11 +3518,17 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				requested.buffer_size = audio_settings_view.buffer_size;
 				requested.input_ports = audio_settings_view.input_filter;
 				requested.output_ports = audio_settings_view.output_filter;
+				requested.board_inputs = audio_settings_view.board_inputs;
 				requested.configured = true;
 
 				const bool same_device = requested.device == settings.audio.device;
 				const bool same_rate = std::fabs(requested.sample_rate - settings.audio.sample_rate) < 0.5;
 				const bool same_buffer = requested.buffer_size == settings.audio.buffer_size;
+
+				// Changing how wide the board's input is changes the chain
+				// itself -- a different number of input ports means a different
+				// plan -- so it is never a re-patch, however little else moved.
+				const bool same_width = requested.board_inputs == settings.audio.board_inputs;
 
 				// Re-pointing the board at different hardware is a change of
 				// *patching*, not of the engine or the server -- so when
@@ -2590,7 +3537,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				// engine restart, a silent gap and a chain rebuild to do it
 				// would be absurd. Anything touching the server's own
 				// settings still needs the restart below.
-				const bool ports_only = same_device && same_rate && same_buffer;
+				const bool ports_only = same_device && same_rate && same_buffer && same_width;
 
 				// A buffer-size change on a server we don't own doesn't need
 				// a restart either: JACK can change its period live, and
@@ -2598,8 +3545,8 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				// alongside it) to do what it already supports would be
 				// wrong. Rate still can't change this way -- the driver is
 				// opened at a rate and keeps it.
-				const bool live_buffer_change =
-					!ports_only && same_device && same_rate && !same_buffer && !jack_server.OwnsServer();
+				const bool live_buffer_change = !ports_only && same_device && same_rate && same_width && !same_buffer &&
+					!jack_server.OwnsServer();
 
 				if (live_buffer_change)
 				{
@@ -2617,7 +3564,8 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 					sf::ChainBuildReport report;
 
 					std::unique_ptr<sf::Chain> resized = sf::BuildChainFromPreset(
-						world, current_source, engine.SampleRate(), safe_block, urid_map, rebuild_error, &report);
+						world, current_source, engine.SampleRate(), safe_block, urid_map, rebuild_error, &report,
+						settings.audio.board_inputs);
 
 					if (!resized)
 					{
@@ -2633,6 +3581,10 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 						engine.WaitForProcessCycles(2);
 						chain = std::move(resized);
 						missing_plugins = report.skipped_uris;
+						collapsed_splits = report.collapsed_splits;
+				collapsed_splits = report.collapsed_splits;
+			collapsed_splits = report.collapsed_splits;
+						skipped_indices = report.skipped_indices;
 						stage_statics_valid = false;
 
 						if (engine.SetBufferSize(requested.buffer_size))
@@ -2705,6 +3657,31 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				}
 			}
 
+			// A bank change lands on that bank's first preset (SF-67), and the
+			// preset list has to follow -- it *is* the current bank, so it is
+			// no more constant than the selection is.
+			if (view.requested_bank != sf::kNoPreset && view.requested_bank != library.CurrentBank() &&
+				view.requested_bank < library.BankCount())
+			{
+				const size_t previous = library.CurrentBank();
+
+				if (library.SelectBank(view.requested_bank) && library.Count() > 0 &&
+					switch_to_preset(library.At(0).preset, library.At(0).path, 0))
+				{
+					refresh_board_presets();
+					refresh_bindings();
+					unsaved_changes = false;
+					ui_status = "Bank '" + library.CurrentBankName() + "'.";
+				}
+				else
+				{
+					// Put the selection back: a bank whose first preset would
+					// not build should not leave the board claiming to be
+					// somewhere it isn't playing from.
+					library.SelectBank(previous);
+				}
+			}
+
 			if (view.stage_edit == sf::StageEdit::ToggleBypass && view.stage_edit_index < chain->StageCount())
 			{
 				// No rebuild: this flips a flag the audio thread reads, and
@@ -2713,9 +3690,49 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				stage->SetBypassed(!stage->IsBypassed());
 				unsaved_changes = true;
 			}
-			else if (view.stage_edit != sf::StageEdit::None && view.stage_edit_index != sf::kNoPreset)
+
+			// A lane's level is not a change of shape, so it does not go
+			// through a rebuild (SF-72). It is written straight into the
+			// running chain, which sweeps to it across its next block, and
+			// into the source graph so that it persists and so that the next
+			// rebuild -- from a move, a preset save, anything -- plans the
+			// value the player last heard.
+			//
+			// A rebuild per frame is what this replaces: the mixer fader
+			// reports continuously, and rebuilding the board sixty times a
+			// second while a mouse moved was never going to be a blend
+			// anyone could set by ear.
+			if (view.graph_edit == sf::GraphEdit::SetLaneGain)
 			{
-				apply_stage_edit(view.stage_edit, view.stage_edit_index);
+				sf::GraphNode* split = current_source.graph.Find(static_cast<sf::NodeId>(view.graph_edit_node));
+
+				if (split && split->kind == sf::NodeKind::Split && view.graph_edit_branch < split->branches.size())
+				{
+					sf::GraphBranch& lane = split->branches[view.graph_edit_branch];
+					lane.gain_db = view.graph_edit_gain_db;
+
+					const size_t merge = current_source.graph.MergeIndexOf(split->id);
+
+					if (merge != sf::kNoMerge)
+					{
+						// A muted lane's level still moves; it just stays at
+						// silence until the mute comes off, which is the same
+						// rule the planner uses.
+						chain->SetMergeGain(static_cast<uint32_t>(merge), view.graph_edit_branch,
+							lane.muted ? 0.0f : sf::GainFromDb(lane.gain_db));
+					}
+
+					unsaved_changes = true;
+				}
+			}
+
+			// One shape edit per frame, applied after everything that reads
+			// the chain this frame -- a rebuild replaces the object those
+			// reads are holding.
+			if (view.graph_edit != sf::GraphEdit::None && view.graph_edit != sf::GraphEdit::InsertPlugin &&
+				view.graph_edit != sf::GraphEdit::SetLaneGain)
+			{
+				apply_graph_edit(view, std::string());
 			}
 
 			// Where the picker is looking, resolved here because this is the
@@ -2780,6 +3797,43 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 							target.maximum = request.maximum;
 							break;
 
+						// The board-wide trims (SF-66). Same shape as
+						// SetControl minus the stage and the symbol -- there
+						// is one of each and neither is in the chain.
+						case sf::LearnTarget::NextBank:
+							target.action = sf::MidiAction::NextBank;
+							break;
+
+						case sf::LearnTarget::SetInputGain:
+						case sf::LearnTarget::SetOutputGain:
+							target.action = request.target == sf::LearnTarget::SetInputGain
+								? sf::MidiAction::SetInputGain
+								: sf::MidiAction::SetOutputGain;
+
+							target.minimum = request.minimum;
+							target.maximum = request.maximum;
+							break;
+
+						// A lane's level into the merge (SF-72). `port` is the
+						// lane -- "a" or "b" -- which is what the MIDI layer's
+						// SetMixerLevel already meant by it.
+						case sf::LearnTarget::SetTempo:
+							target.action = sf::MidiAction::SetTempo;
+							target.minimum = request.minimum;
+							target.maximum = request.maximum;
+							break;
+
+						case sf::LearnTarget::ToggleMetronome:
+							target.action = sf::MidiAction::ToggleMetronome;
+							break;
+
+						case sf::LearnTarget::SetMixerLevel:
+							target.action = sf::MidiAction::SetMixerLevel;
+							target.port = request.symbol;
+							target.minimum = request.minimum;
+							target.maximum = request.maximum;
+							break;
+
 						default:
 							break;
 					}
@@ -2831,23 +3885,56 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				unsaved_changes = true;
 			}
 
+			// The board-wide trims (SF-66). Deliberately *not* setting
+			// `unsaved_changes`: these are settings, not part of the preset,
+			// and dirtying the board because someone matched the output to
+			// their interface would be wrong.
+			if (std::isfinite(view.input_gain_request))
+			{
+				settings.input_gain_db = view.input_gain_request;
+				engine.SetInputGainDb(view.input_gain_request);
+			}
+
+			if (std::isfinite(view.output_gain_request))
+			{
+				settings.output_gain_db = view.output_gain_request;
+				engine.SetOutputGainDb(view.output_gain_request);
+			}
+
 			if (view.requested_plugin < board_plugins.size())
 			{
 				const sf::BoardPlugin& chosen = board_plugins[view.requested_plugin];
 
-				const sf::Preset edited = PresetWithAddedStage(*chain, urid_map, current_name, chosen.uri);
-
-				if (!switch_to_preset(edited, current_path, current_index, false))
+				if (view.graph_edit == sf::GraphEdit::InsertPlugin)
 				{
-					// Most often a channel-count mismatch with the stage
-					// before it. The running chain is untouched either way.
-					ui_status = "Could not add " + chosen.name + ": " + error;
+					// Somewhere in particular: a "+" on the board was pressed,
+					// and the request carries which gap it was.
+					apply_graph_edit(view, chosen.uri);
 				}
 				else
 				{
-					unsaved_changes = true;
-					ui_status = "Added " + chosen.name + ".";
+					const sf::Preset edited = PresetWithAddedStage(*chain, urid_map, current_name, chosen.uri);
+
+					if (!switch_to_preset(edited, current_path, current_index, false))
+					{
+						// Most often a channel count this host can't adapt.
+						// The running chain is untouched either way.
+						ui_status = "Could not add " + chosen.name + ": " + error;
+					}
+					else
+					{
+						unsaved_changes = true;
+						ui_status = "Added " + chosen.name + ".";
+					}
 				}
+			}
+
+			// The plugs at the ends of the wire are a way into the audio
+			// settings rather than a second place to say the same thing --
+			// there is one routing configuration, and this is where it lives.
+			if (view.input_routing_requested || view.output_routing_requested)
+			{
+				view.audio_settings_requested = true;
 			}
 
 			if (view.save_requested)
@@ -2878,7 +3965,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 	}
 #endif
 
-	settings.last_preset = std::filesystem::path(current_path).stem().string();
+	settings.last_preset = remember_preset(current_path);
 	save_settings();
 
 #ifdef SIGNALFORGE_GUI
@@ -2996,6 +4083,17 @@ struct TestChainOptions
 	// Stage indices to bypass, so the bypass path can be measured offline
 	// rather than only by ear.
 	std::vector<size_t> bypass_stages;
+
+	// How many channels the board takes in (SF-76). 0 is the auto rule --
+	// as many as the first pedal wants -- which is what this always did
+	// before there was a way to say otherwise.
+	unsigned board_inputs = 0;
+
+	// Lane levels pushed into the *running* chain rather than planned into it
+	// (SF-72): `{lane, dB}` on merge 0, the only split a test board has. This
+	// is the offline way to reach `Chain::SetMergeGain`, which is otherwise
+	// only ever called from a slider nothing headless can move.
+	std::vector<std::pair<unsigned, float>> lane_gains;
 };
 
 // Headless: builds the chain and pushes a sine sweep through it with no
@@ -3029,7 +4127,7 @@ int TestChain(const std::vector<std::string>& uri_strings, const std::vector<Cha
 		sf::ChainBuildReport report;
 
 		chain = sf::BuildChainFromPreset(
-			world, preset, options.sample_rate, options.block_size, urid_map, error, &report);
+			world, preset, options.sample_rate, options.block_size, urid_map, error, &report, options.board_inputs);
 
 		if (!chain)
 		{
@@ -3055,7 +4153,8 @@ int TestChain(const std::vector<std::string>& uri_strings, const std::vector<Cha
 	}
 	else
 	{
-		chain = sf::Chain::Create(world, uri_strings, options.sample_rate, options.block_size, urid_map);
+		chain = sf::Chain::Create(
+			world, uri_strings, options.sample_rate, options.block_size, urid_map, nullptr, options.board_inputs);
 
 		if (!chain)
 		{
@@ -3089,6 +4188,30 @@ int TestChain(const std::vector<std::string>& uri_strings, const std::vector<Cha
 		}
 
 		chain->Stage(stage_index)->SetBypassed(true);
+	}
+
+	// Lane levels, set the way the mixer card sets them: on the built chain,
+	// with no replan (SF-72). Applied after Settle so it lands on exactly the
+	// chain that is about to run.
+	//
+	// The first block sweeps from the planned value to this one rather than
+	// stepping to it, so a run that changes a level is *not* sample-identical
+	// to one that was planned with it -- the two differ for one block and
+	// agree forever after. That is what the ramp is for, and it is why the
+	// tests around this assert which runs differ rather than which match.
+	for (const std::pair<unsigned, float>& lane : options.lane_gains)
+	{
+		if (chain->MergeCount() == 0)
+		{
+			std::fprintf(stderr, "--lane-gain: this chain has no split, so it has no lanes.\n");
+			lilv_world_free(world);
+			return 1;
+		}
+
+		chain->SetMergeGain(0, lane.first, sf::GainFromDb(lane.second));
+
+		std::printf("  lane %c set live to %+.1f dB\n", lane.first == 0 ? 'A' : 'B',
+			static_cast<double>(lane.second));
 	}
 
 	// Deliberately not a whole number of blocks: the final short block
@@ -3185,11 +4308,11 @@ int SavePreset(const char* output_path, const std::vector<std::string>& uri_stri
 		return 1;
 	}
 
-	std::printf("Saved preset '%s' (%zu stage(s)) to %s\n", preset.name.c_str(), preset.chain.size(), output_path);
+	std::printf("Saved preset '%s' (%zu stage(s)) to %s\n", preset.name.c_str(), preset.graph.PluginCount(), output_path);
 
-	for (size_t i = 0; i < preset.chain.size(); ++i)
+	for (size_t i = 0; i < preset.graph.PluginCount(); ++i)
 	{
-		const sf::PresetStage& stage = preset.chain[i];
+		const sf::PresetStage& stage = *preset.graph.PluginAt(i);
 		std::printf("  [%zu] %s: %zu control(s), %zu byte(s) of state\n", i, stage.uri.c_str(), stage.controls.size(),
 			stage.state.size());
 	}
@@ -3233,11 +4356,11 @@ int PresetRoundTrip(const char* path)
 
 	std::printf("Loaded '%s':\n", path);
 	std::printf("  name:    %s\n", original.name.c_str());
-	std::printf("  stages:  %zu\n", original.chain.size());
+	std::printf("  stages:  %zu\n", original.graph.PluginCount());
 
-	for (size_t i = 0; i < original.chain.size(); ++i)
+	for (size_t i = 0; i < original.graph.PluginCount(); ++i)
 	{
-		const sf::PresetStage& stage = original.chain[i];
+		const sf::PresetStage& stage = *original.graph.PluginAt(i);
 		std::printf("    [%zu] %s%s, %zu control(s), %s\n", i, stage.uri.c_str(), stage.bypassed ? " (bypassed)" : "",
 			stage.controls.size(), stage.state.empty() ? "no state" : "has state");
 	}
@@ -3323,7 +4446,7 @@ int TestAddStage(const std::string& query, const std::string& preset_dir, const 
 	// be bad enough; inheriting its LV2 state would silently carry over
 	// another plugin's loaded model or impulse response.
 	{
-		const sf::PresetStage& appended = edited.chain.back();
+		const sf::PresetStage& appended = *edited.graph.PluginAt(edited.graph.PluginCount() - 1);
 
 		if (!appended.controls.empty() || !appended.state.empty() || appended.bypassed)
 		{
@@ -3922,6 +5045,30 @@ int main(int argc, char** argv)
 			else if (std::strcmp(argv[i], "--bypass") == 0 && i + 1 < argc)
 			{
 				options.bypass_stages.push_back(static_cast<size_t>(std::atoi(argv[i + 1])));
+				++i;
+			}
+			else if (std::strcmp(argv[i], "--board-inputs") == 0 && i + 1 < argc)
+			{
+				options.board_inputs = static_cast<unsigned>(std::atoi(argv[i + 1]));
+				++i;
+			}
+			else if (std::strcmp(argv[i], "--lane-gain") == 0 && i + 1 < argc)
+			{
+				// "a=-12" / "b=0". A lane name rather than an index, because
+				// that is what the board, the mapping file and this all call
+				// it -- three spellings of the same lane would be three
+				// chances to mean the other one.
+				const std::string spec = argv[i + 1];
+				const size_t equals = spec.find('=');
+
+				if (equals != 1 || (spec[0] != 'a' && spec[0] != 'b'))
+				{
+					std::fprintf(stderr, "--lane-gain wants <a|b>=<dB>, e.g. \"b=-12\", not \"%s\".\n", spec.c_str());
+					return 1;
+				}
+
+				options.lane_gains.emplace_back(
+					spec[0] == 'a' ? 0u : 1u, static_cast<float>(std::atof(spec.c_str() + equals + 1)));
 				++i;
 			}
 			else

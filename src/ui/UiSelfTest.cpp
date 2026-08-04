@@ -1,16 +1,20 @@
 #include "UiSelfTest.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"
 
 #include "AppWindow.h"
 #include "AudioSettingsView.h"
 #include "BoardView.h"
+#include "ChainView.h"
 
 namespace sf
 {
@@ -26,6 +30,12 @@ constexpr int kSettleFrames = 2;
 // the frame in which the mouse was released.
 struct Step
 {
+	// A card to expand first, or null when the widget is visible without one.
+	// Every card is expandable in place now (SF-70), so the controls and the
+	// learn buttons of a stage are behind its own arrow rather than behind a
+	// selection shared by the whole board.
+	const char* expand;
+
 	const char* widget;
 	const char* what;
 	bool (*check)(const BoardViewState&);
@@ -41,19 +51,57 @@ bool ExpectBypass1(const BoardViewState& view)
 	return view.stage_edit == StageEdit::ToggleBypass && view.stage_edit_index == 1;
 }
 
+// Shape edits name a node, not a position: the node ids the self-test's graph
+// hands out are 1-based, so stage N is node N + 1.
 bool ExpectMoveDown0(const BoardViewState& view)
 {
-	return view.stage_edit == StageEdit::MoveDown && view.stage_edit_index == 0;
+	return view.graph_edit == GraphEdit::MoveLater && view.graph_edit_node == 1;
 }
 
 bool ExpectMoveUp2(const BoardViewState& view)
 {
-	return view.stage_edit == StageEdit::MoveUp && view.stage_edit_index == 2;
+	return view.graph_edit == GraphEdit::MoveEarlier && view.graph_edit_node == 3;
 }
 
 bool ExpectRemove2(const BoardViewState& view)
 {
-	return view.stage_edit == StageEdit::Remove && view.stage_edit_index == 2;
+	return view.graph_edit == GraphEdit::Remove && view.graph_edit_node == 3;
+}
+
+// The `x` on a card. Keyed by node id like every other shape edit, since a
+// position stops meaning the same thing the moment anything is inserted.
+bool ExpectRemoveNode2(const BoardViewState& view)
+{
+	return view.graph_edit == GraphEdit::Remove && view.graph_edit_node == 2;
+}
+
+// An "Add stage" asks for the browser rather than inserting anything on its
+// own: what goes there is chosen next.
+bool ExpectNoEditYet(const BoardViewState& view)
+{
+	return view.graph_edit == GraphEdit::None && view.stage_edit == StageEdit::None;
+}
+
+// The browser's other option: put a split where the pedal would have gone. It
+// has to carry the slot that was pressed, or the split lands somewhere else.
+bool ExpectInsertSplit(const BoardViewState& view)
+{
+	return view.graph_edit == GraphEdit::InsertSplit && view.graph_edit_slot.split == kNoBoardNode;
+}
+
+// Expanding a card shows its controls and does nothing else. An arrow that
+// also bypassed or removed something would be worse than no arrow at all.
+bool ExpectExpandOnly(const BoardViewState& view)
+{
+	return view.graph_edit == GraphEdit::None && view.stage_edit == StageEdit::None &&
+		view.requested_preset == kNoPreset;
+}
+
+// `2 channels` splits the board at the end of the trunk; `1 channel` collapses
+// it back. This is the only control that does either (SF-72).
+bool ExpectSplitRequested(const BoardViewState& view)
+{
+	return view.graph_edit == GraphEdit::InsertSplit && view.graph_edit_slot.split == kNoBoardNode;
 }
 
 // The learn buttons. Each says what it asked to bind, and -- just as
@@ -86,23 +134,51 @@ bool ExpectLearnBypass1(const BoardViewState& view)
 // not "nothing visible", nothing.
 bool ExpectNothing(const BoardViewState& view)
 {
-	return view.stage_edit == StageEdit::None && view.requested_preset == kNoPreset && !view.save_requested;
+	return view.stage_edit == StageEdit::None && view.graph_edit == GraphEdit::None &&
+		view.requested_preset == kNoPreset && !view.save_requested;
+}
+
+// The header's way into the audio settings. It replaced the plugs at the ends
+// of the wire, which went with the canvas -- and the menu bar before them.
+bool ExpectAudioSettings(const BoardViewState& view)
+{
+	return view.audio_settings_requested && view.graph_edit == GraphEdit::None;
 }
 
 // The library-wide and per-preset ones, all reachable without opening a stage.
 const Step kLearnSteps[] = {
-	{"learn-next:0", "arming learn for next_preset", ExpectLearnNext},
-	{"learn-prev:0", "arming learn for prev_preset", ExpectLearnPrev},
-	{"learn-preset:2", "arming learn for the third preset", ExpectLearnPreset2},
+	{nullptr, "learn-next:0", "arming learn for next_preset", ExpectLearnNext},
+	{nullptr, "learn-prev:0", "arming learn for prev_preset", ExpectLearnPrev},
+	{nullptr, "learn-preset:2", "arming learn for the third preset", ExpectLearnPreset2},
 };
 
 const Step kSteps[] = {
-	{"preset:0", "clicking the first preset", ExpectPreset0},
-	{"bypass:1", "toggling bypass on stage 1", ExpectBypass1},
-	{"down:0", "moving stage 0 later", ExpectMoveDown0},
-	{"up:2", "moving stage 2 earlier", ExpectMoveUp2},
-	{"remove:2", "removing stage 2", ExpectRemove2},
-	{"up:0", "clicking the disabled 'move earlier' on stage 0", ExpectNothing},
+	{nullptr, "preset:0", "clicking the first preset", ExpectPreset0},
+
+	// The chain area: expanding a card, the `x` on one, and the Add stage
+	// that ends a section.
+	{nullptr, "expand:2", "expanding a stage card", ExpectExpandOnly},
+	{nullptr, "remove:2", "the x on a card", ExpectRemoveNode2},
+	{nullptr, "add-stage:pre", "Add stage at the end of the pre-split section", ExpectNoEditYet},
+
+	// The browser is now open over the board -- which is itself the proof
+	// that Add stage did something -- and choosing a split there closes it
+	// again, carrying the slot that was pressed.
+	{nullptr, "browser-split:0", "choosing a split in the browser", ExpectInsertSplit},
+
+	// The header's ghost button, which is now the only way into the audio
+	// settings.
+	{nullptr, "menu:audio-settings", "opening audio settings from the header", ExpectAudioSettings},
+
+	// The signal-path control, the one thing that splits the board.
+	{nullptr, "channels:1", "asking for two channels", ExpectSplitRequested},
+
+	// Per-card controls. Each says which card it is behind, because the
+	// controls and the learn buttons live inside an expanded card now.
+	{nullptr, "bypass:1", "toggling bypass on a card", ExpectBypass1},
+	{nullptr, "down:1", "moving the first stage later", ExpectMoveDown0},
+	{nullptr, "up:3", "moving the last stage earlier", ExpectMoveUp2},
+	{nullptr, "remove:3", "removing the last stage", ExpectRemove2},
 };
 
 const WidgetProbe* Find(const std::vector<WidgetProbe>& widgets, const char* id)
@@ -136,6 +212,112 @@ size_t CountWithPrefix(const std::vector<WidgetProbe>& widgets, const char* pref
 	return found;
 }
 
+// A linear board matching a stage list: node N + 1 is stage N. The graph and
+// the chain are separate things (a pedal whose plugin is missing is in one and
+// not the other), so even the simple case has to be stated rather than
+// assumed.
+BoardGraphNodes LinearGraph(size_t stage_count)
+{
+	BoardGraphNodes nodes;
+
+	for (size_t i = 0; i < stage_count; ++i)
+	{
+		BoardGraphNode node;
+		node.id = static_cast<BoardNodeId>(i + 1);
+		node.stage = i;
+
+		nodes.push_back(node);
+	}
+
+	return nodes;
+}
+
+// The same board with a split in the middle: pedal 0, then a split whose top
+// lane is a bare wire and whose bottom lane holds pedal 1, then pedal 2.
+// Drawn so the parts only a split has -- lane mutes, the rejoin, a lane's own
+// insertion points -- are exercised rather than only described.
+//
+// The pedal is in **CHANNEL B**, the far lane, deliberately (SF-74). A stage
+// in lane A is the case that works by accident: its flat index is the same one
+// it would have on a linear board, so a card that ignored lanes entirely would
+// still address it correctly. Lane B is the one that has to be counted --
+// everything in lane A comes first in signal order -- and it is the lane the
+// acceptance names.
+//
+// Lane B is also the muted one, so the card is drawn inside a lane that is
+// contributing nothing. That is on purpose too: a muted lane still runs, and
+// its pedals keep their controls and their bindings.
+BoardGraphNodes SplitGraph()
+{
+	BoardGraphNodes nodes = LinearGraph(1);
+
+	BoardGraphNode split;
+	split.id = 10;
+	split.split = true;
+	split.branches.resize(2);
+	split.branches[1].muted = true;
+	split.branches[1].gain_db = -6.0f;
+
+	// Lane A is sent something other than unity so that clicking the middle of
+	// its -24..+24 dB slider is a *change*. At the default of 0 dB the middle
+	// of that slider is where the handle already is, and a test that clicked
+	// it would be asserting nothing while looking like it asserted something.
+	split.splitter.send_db[0] = -18.0f;
+
+	// Still stage 1: flattening takes all of lane A before lane B, and lane A
+	// is empty, so the one pedal in the split keeps the index it had.
+	BoardGraphNode inside;
+	inside.id = 2;
+	inside.stage = 1;
+	split.branches[1].nodes.push_back(inside);
+
+	nodes.push_back(split);
+
+	BoardGraphNode after;
+	after.id = 3;
+	after.stage = 2;
+	nodes.push_back(after);
+
+	return nodes;
+}
+
+// One empty split, for building shapes this editor refuses to draw.
+BoardGraphNode EmptySplit(BoardNodeId id)
+{
+	BoardGraphNode split;
+	split.id = id;
+	split.split = true;
+	split.branches.resize(2);
+
+	return split;
+}
+
+// Two splits on the trunk. Legal in the model -- the graph has always allowed
+// it -- and unreachable through this editor, which offers one split at one
+// place. A preset written by hand, or by an older version, can be this.
+BoardGraphNodes TwoSplitsGraph()
+{
+	BoardGraphNodes nodes = LinearGraph(1);
+	nodes.push_back(EmptySplit(10));
+	nodes.push_back(EmptySplit(11));
+
+	return nodes;
+}
+
+// A split inside a channel: the other shape the board draws one level of and
+// so cannot show.
+BoardGraphNodes NestedSplitGraph()
+{
+	BoardGraphNodes nodes = LinearGraph(1);
+
+	BoardGraphNode split = EmptySplit(10);
+	split.branches[0].nodes.push_back(EmptySplit(11));
+
+	nodes.push_back(split);
+
+	return nodes;
+}
+
 }  // namespace
 
 int RunUiSelfTest(int frames)
@@ -143,10 +325,21 @@ int RunUiSelfTest(int frames)
 	AppWindow window;
 	std::string error;
 
-	// Tall enough that everything the test clicks is on screen at once. The real
+	// Big enough that everything the test clicks is on screen at once. The real
 	// window scrolls; a test that had to scroll first would be testing the
 	// scrollbar rather than the thing under it.
-	if (!window.Open("Signalforge (test)", 700, 1100, error))
+	//
+	// Wide as well as tall since SF-62: the sidebar takes a fixed 330px and the
+	// chain gets the rest, so a narrow window leaves the board's right-hand end
+	// -- including the "x" on a tile, which sits on its top-right corner --
+	// outside the visible area rather than merely awkward to reach.
+	//
+	// Taller again since SF-75: the splitter card gained a mode's worth of
+	// contents and two sends, which pushed the mixer under it off the bottom.
+	// The symptom of running out of room is a click that lands on nothing and
+	// an edit that is never reported -- it reads exactly like the widget being
+	// broken, so it is worth knowing that this is the number to look at.
+	if (!window.Open("Signalforge (test)", 1280, 1500, error))
 	{
 		std::fprintf(stderr, "FAIL: %s\n", error.c_str());
 		return 1;
@@ -179,10 +372,33 @@ int RunUiSelfTest(int frames)
 	// A file-valued parameter, the kind neural-amp-modeler-lv2 has.
 	stages[1].paths = {{"urn:test:model", "Neural Model", "/models/amps/current.nam", {"nam", "wav"}}};
 
+	// One stage that declares an editor of its own and one that doesn't: the
+	// `Open plugin UI` button is only drawn for the former, and "most plugins
+	// have no editor" is the case that must not grow a button (SF-79).
+	stages[1].has_custom_ui = true;
+
 	// Already-bound bypass and control, so the "currently CC 80" half of the
 	// learn affordance is drawn too, not just the button.
 	stages[1].bypass_binding = "CC 80";
 	stages[1].controls[0].binding = "CC 7 ch2";
+
+	// What the tuner is showing, driven through its three states below.
+	BoardTuner tuner;
+
+	// ...and what the metronome is doing, likewise.
+	BoardMetronome metronome;
+
+	// The gate's settings as the card sees them.
+	BoardGate gate;
+
+	// The mappings table's rows (SF-78), one of each kind that renders
+	// differently: a switch with a target, a switch with none, and a
+	// value-driven binding whose range has to show.
+	const std::vector<BoardMidiBinding> midi_bindings = {
+		{"CC 80", "toggle_bypass", "stage 1", ""},
+		{"PC 3", "next_preset", "", ""},
+		{"CC 7 ch2", "set_control", "stage 1 'gain'", "-18..18"},
+	};
 
 	// A listing the picker will be handed. None of this exists on disk, which
 	// is the point: the view never touches a filesystem.
@@ -198,6 +414,13 @@ int RunUiSelfTest(int frames)
 	// Start on the second preset, so clicking the first is a real change
 	// rather than a click that would look successful either way.
 	const size_t starting_preset = 1;
+
+	// The shape the board is drawn from. A pointer rather than a value so a
+	// phase can swap in a different one -- the split board, or a board with a
+	// missing pedal -- without rebuilding the draw lambda around it.
+	const BoardGraphNodes linear = LinearGraph(stages.size());
+	const BoardGraphNodes split_board = SplitGraph();
+	const BoardGraphNodes* board_graph = &linear;
 
 	BoardViewUi ui;
 	ImGuiIO& io = ImGui::GetIO();
@@ -251,10 +474,25 @@ int RunUiSelfTest(int frames)
 		view.input_db = meter_input_db;
 		view.output_db = meter_output_db;
 		view.output_clipping = degraded;
-		view.midi_bindings = 3;
+
+		// Enough load to light the gauge into its warn band, so the coloured
+		// branches of DrawLoadGauge are drawn by every ordinary frame rather
+		// than only on a machine that happens to be struggling.
+		view.dsp_load = 0.64f;
+		// The sidebar's figure and the mappings table are two renderings of one
+		// list, and SF-78 asks that they agree. Taking the count *from* the
+		// list rather than stating it twice is what makes that true by
+		// construction here; the assertion below is about the view, which
+		// could still draw the wrong number of rows.
+		view.midi_map = &midi_bindings;
+		view.tuner = tuner;
+		view.metronome = metronome;
+		view.gate = gate;
+		view.midi_bindings = midi_bindings.size();
 		view.current_preset = starting_preset;
 		view.presets = &presets;
 		view.stages = chain_stages;
+		view.graph = board_graph;
 		view.plugins = &plugins;
 		view.plugins_hidden = 7;
 		view.file_entries = &listing;
@@ -331,9 +569,52 @@ int RunUiSelfTest(int frames)
 		widgets = draw(nullptr, false, &stages).widgets;
 	}
 
+	// Bypass polarity, asserted before anything clicks anything (SF-70).
+	//
+	// **Checked means active**, which is inverted from the `bypassed` flag it
+	// drives and from every version of this checkbox before the redesign. A
+	// test that only checked that clicking it reports ToggleBypass would pass
+	// just as happily with the tick on the wrong side, and the wrong side is
+	// where it was.
+	{
+		const WidgetProbe* running = Find(widgets, "bypass:0");
+		const WidgetProbe* bypassed = Find(widgets, "bypass:1");
+
+		if (!running || !bypassed)
+		{
+			std::fprintf(stderr, "FAIL: the board drew no bypass checkbox.\n");
+			return 1;
+		}
+
+		if (!running->checked)
+		{
+			std::fprintf(stderr, "FAIL: an active stage's checkbox is unticked -- the polarity is inverted.\n");
+			return 1;
+		}
+
+		if (bypassed->checked)
+		{
+			std::fprintf(stderr, "FAIL: a bypassed stage's checkbox is ticked -- the polarity is inverted.\n");
+			return 1;
+		}
+	}
+
 	// Phase 1: the stage list and preset list.
 	for (const Step& step : kSteps)
 	{
+		if (step.expand)
+		{
+			const BoardViewState selected = click(widgets, step.expand, &stages);
+
+			if (closed_early || selected.widgets.empty())
+			{
+				std::fprintf(stderr, "FAIL: could not select a tile for '%s'.\n", step.what);
+				return 1;
+			}
+
+			widgets = selected.widgets;
+		}
+
 		const BoardViewState view = click(widgets, step.widget, &stages);
 
 		if (closed_early)
@@ -349,26 +630,56 @@ int RunUiSelfTest(int frames)
 
 		if (!step.check(view))
 		{
-			std::fprintf(stderr, "FAIL: %s did not do what it should (edit=%d index=%zu preset=%zu).\n", step.what,
-				static_cast<int>(view.stage_edit), view.stage_edit_index, view.requested_preset);
+			std::fprintf(stderr,
+				"FAIL: %s did not do what it should (stage_edit=%d index=%zu graph_edit=%d node=%u preset=%zu).\n",
+				step.what, static_cast<int>(view.stage_edit), view.stage_edit_index,
+				static_cast<int>(view.graph_edit), view.graph_edit_node, view.requested_preset);
 			return 1;
 		}
 
-		widgets = view.widgets;
+		// One settling frame between steps. A step that opens something --
+		// the plugin browser over the board -- reports positions from the
+		// frame it opened in, and Dear ImGui may still move a popup on its
+		// second frame; aiming at where it *was* would miss.
+		widgets = draw(nullptr, false, &stages).widgets;
 	}
 
-	// The disabled states the view is responsible for: nothing above the first
-	// stage, and nothing below the last.
-	if (const WidgetProbe* probe = Find(widgets, "up:0"); !probe || probe->enabled)
+	// A card for every stage, and one Add stage ending the section they are
+	// in. Insertion is by section append plus `^`/`v` now, so the count is one
+	// per section rather than one per gap (SF-71).
 	{
-		std::fprintf(stderr, "FAIL: 'move earlier' on the first stage should be disabled.\n");
-		return 1;
-	}
+		const size_t cards = CountWithPrefix(widgets, "expand:");
+		const size_t adds = CountWithPrefix(widgets, "add-stage:");
 
-	if (const WidgetProbe* probe = Find(widgets, "down:2"); !probe || probe->enabled)
-	{
-		std::fprintf(stderr, "FAIL: 'move later' on the last stage should be disabled.\n");
-		return 1;
+		if (cards != stages.size())
+		{
+			std::fprintf(stderr, "FAIL: the board drew %zu card(s) for %zu stage(s).\n", cards, stages.size());
+			return 1;
+		}
+
+		// An unsplit board is one section, so one Add stage.
+		if (adds != 1)
+		{
+			std::fprintf(stderr, "FAIL: an unsplit board drew %zu Add stage button(s), expected 1.\n", adds);
+			return 1;
+		}
+
+		// The ends of a lane: `^` on the first card and `v` on the last have
+		// nowhere to go, and must be drawn disabled rather than silently doing
+		// nothing. Node ids are 1-based, so the first card is node 1.
+		if (const WidgetProbe* probe = Find(widgets, "up:1"); !probe || probe->enabled)
+		{
+			std::fprintf(stderr, "FAIL: the first card still offered to move earlier.\n");
+			return 1;
+		}
+
+		const std::string last = "down:" + std::to_string(stages.size());
+
+		if (const WidgetProbe* probe = Find(widgets, last.c_str()); !probe || probe->enabled)
+		{
+			std::fprintf(stderr, "FAIL: the last card still offered to move later.\n");
+			return 1;
+		}
 	}
 
 	// Phase 2: the plugin browser.
@@ -390,7 +701,7 @@ int RunUiSelfTest(int frames)
 		// Opens the browser and returns the frame in which its rows exist.
 		auto open_browser = [&](const std::vector<WidgetProbe>& from)
 		{
-			const BoardViewState opened = click(from, "add-stage:0", &stages);
+			const BoardViewState opened = click(from, "add-stage:pre", &stages);
 
 			if (closed_early || opened.widgets.empty())
 			{
@@ -495,21 +806,28 @@ int RunUiSelfTest(int frames)
 		}
 	}
 
-	// Phase 3: the auto-generated control panel.
+	// Phase 3: the auto-generated controls inside a card.
 	{
-		// Collapsed by default: a board of four pedals with thirty controls
-		// each would otherwise open as a wall of sliders.
-		if (CountWithPrefix(widgets, "control:") != 0)
+		// The step table above left a card open. Closed here rather than
+		// worked around, because the first thing this phase asserts is what a
+		// *collapsed* card draws.
+		ui.expanded_nodes.clear();
+		widgets = draw(nullptr, false, &stages).widgets;
+
+		// A collapsed card draws none of its controls. Every card is
+		// collapsed to begin with, so a board of four plugins with thirty
+		// controls each opens as four rows rather than as a wall of sliders.
+		if (CountWithPrefix(widgets, "control:1:") != 0)
 		{
-			std::fprintf(stderr, "FAIL: stage controls were drawn while the stage was collapsed.\n");
+			std::fprintf(stderr, "FAIL: a collapsed card drew its controls.\n");
 			return 1;
 		}
 
-		BoardViewState view = click(widgets, "expand:1", &stages);
+		BoardViewState view = click(widgets, "expand:2", &stages);
 
 		if (closed_early || view.widgets.empty())
 		{
-			std::fprintf(stderr, "FAIL: could not expand a stage.\n");
+			std::fprintf(stderr, "FAIL: could not expand a card.\n");
 			return 1;
 		}
 
@@ -517,15 +835,15 @@ int RunUiSelfTest(int frames)
 
 		if (CountWithPrefix(view.widgets, "control:") != drive_controls.size())
 		{
-			std::fprintf(stderr, "FAIL: expanding drew %zu of %zu control(s).\n",
+			std::fprintf(stderr, "FAIL: expanding a card drew %zu of %zu control(s).\n",
 				CountWithPrefix(view.widgets, "control:"), drive_controls.size());
 			return 1;
 		}
 
-		// Only the expanded stage's controls, not every stage's.
+		// Only the expanded card's controls, not every card's.
 		if (CountWithPrefix(view.widgets, "control:0:") != 0 || CountWithPrefix(view.widgets, "control:2:") != 0)
 		{
-			std::fprintf(stderr, "FAIL: expanding one stage drew another stage's controls.\n");
+			std::fprintf(stderr, "FAIL: expanding one card drew another card's controls.\n");
 			return 1;
 		}
 
@@ -580,16 +898,59 @@ int RunUiSelfTest(int frames)
 			return 1;
 		}
 
-		// And collapsing puts them away again.
+		// The arrow toggles: pressing it again puts the controls away.
+		//
+		// This *is* a toggle now, where the old selection deliberately wasn't
+		// -- a selection that toggled made the panel vanish under the second
+		// click of a double one, but an expander that doesn't collapse is just
+		// broken.
+		view = draw(nullptr, false, &stages);
+		view = click(view.widgets, "expand:2", &stages);
+		view = draw(nullptr, false, &stages);
+
+		if (CountWithPrefix(view.widgets, "control:1:") != 0)
+		{
+			std::fprintf(stderr, "FAIL: collapsing a card left %zu control(s) drawn.\n",
+				CountWithPrefix(view.widgets, "control:"));
+			return 1;
+		}
+
+		// Two cards open at once, which the old one-selected-pedal panel could
+		// not do and is the main thing the redesign buys.
+		//
+		// The second card opened is the one *above* the first, deliberately:
+		// expanding a card pushes everything below it down, and on a board
+		// this size the next card's probe would land below the fold of a pane
+		// that scrolls. Aiming upward keeps the target where it was recorded.
+		view = draw(nullptr, false, &stages);
+		view = click(view.widgets, "expand:2", &stages);
 		view = draw(nullptr, false, &stages);
 		view = click(view.widgets, "expand:1", &stages);
 		view = draw(nullptr, false, &stages);
 
-		if (CountWithPrefix(view.widgets, "control:") != 0)
+		// Checked through each card's Bypass learn button rather than through
+		// its controls: only one of these stages has any, and what is being
+		// asserted is that two *bodies* are open at once.
+		if (!Find(view.widgets, "learn-bypass:0") || !Find(view.widgets, "learn-bypass:1"))
 		{
-			std::fprintf(stderr, "FAIL: collapsing a stage left %zu control(s) drawn.\n",
-				CountWithPrefix(view.widgets, "control:"));
+			std::fprintf(stderr, "FAIL: two expanded cards did not both draw their bodies.\n");
 			return 1;
+		}
+
+		// Put them away again so what follows starts from a closed board.
+		//
+		// **More than one settling frame.** A stage card is an
+		// ImGuiChildFlags_AutoResizeY child: it measures its contents on one
+		// frame and takes that height on the next, so after a layout change
+		// this big the positions reported by the very next frame are still
+		// mid-settle, and a click aimed with them lands on the gap between two
+		// cards. This is the same hazard kSettleFrames exists for, one level
+		// down.
+		ui.expanded_nodes.clear();
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			view = draw(nullptr, false, &stages);
 		}
 
 		widgets = view.widgets;
@@ -597,7 +958,7 @@ int RunUiSelfTest(int frames)
 
 	// Phase 4: the file picker.
 	{
-		BoardViewState view = click(widgets, "expand:1", &stages);
+		BoardViewState view = click(widgets, "expand:2", &stages);
 		view = draw(nullptr, false, &stages);
 
 		// The button shows the loaded file, not the whole path, and not the
@@ -684,8 +1045,8 @@ int RunUiSelfTest(int frames)
 			return 1;
 		}
 
-		// Put the stage away again so the checks below see a tidy list.
-		view = click(view.widgets, "expand:1", &stages);
+		// Put the card away again so the checks below see a tidy list.
+		view = click(view.widgets, "expand:2", &stages);
 		widgets = draw(nullptr, false, &stages).widgets;
 	}
 
@@ -727,17 +1088,47 @@ int RunUiSelfTest(int frames)
 			widgets = view.widgets;
 		}
 
-		// Bypass and the controls belong to a stage, so they only appear once
-		// it is open -- a collapsed board would otherwise be a row of learn
-		// buttons with nothing to say which pedal they belong to.
-		if (Find(widgets, "learn-bypass:1"))
+		// Bypass and the controls belong to a stage, so they only appear
+		// inside an expanded card -- a board that drew them all would be a row
+		// of learn buttons with nothing to say which stage each belongs to.
 		{
-			std::fprintf(stderr, "FAIL: a collapsed stage drew its bypass learn button.\n");
-			return 1;
+			const BoardViewState elsewhere = click(widgets, "expand:1", &stages);
+
+			if (closed_early || elsewhere.widgets.empty())
+			{
+				std::fprintf(stderr, "FAIL: could not select another pedal.\n");
+				return 1;
+			}
+
+			if (Find(elsewhere.widgets, "learn-bypass:1"))
+			{
+				std::fprintf(stderr, "FAIL: an unselected pedal drew its bypass learn button.\n");
+				return 1;
+			}
+
+			widgets = elsewhere.widgets;
 		}
 
-		BoardViewState view = click(widgets, "expand:1", &stages);
-		view = draw(nullptr, false, &stages);
+		// Close it again before opening the one this actually wants: a card
+		// left open above the target pushes it down, and the probe recorded
+		// for the target would then be aimed at the gap where it used to be.
+		ui.expanded_nodes.clear();
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			widgets = draw(nullptr, false, &stages).widgets;
+		}
+
+		BoardViewState view = click(widgets, "expand:2", &stages);
+
+		// A settling frame per the note above: the card grew, so everything
+		// under it has moved and the learn button's position is only
+		// trustworthy once the auto-resizing child has taken its new height.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			view = draw(nullptr, false, &stages);
+		}
+
 		view = click(view.widgets, "learn-bypass:1", &stages);
 
 		if (closed_early || view.widgets.empty())
@@ -810,10 +1201,11 @@ int RunUiSelfTest(int frames)
 		}
 
 		// A count, so "all of them were disabled" can't be satisfied by drawing
-		// none of them at all: next and prev, one per preset, and -- stage 1
-		// being open -- its bypass and each of its writable controls. The meter
+		// none of them at all: next and prev, next bank (SF-67), the two
+		// board-wide trims (SF-66), one per preset, and -- one card being
+		// expanded -- its bypass and each of its writable controls. The meter
 		// has nothing to bind.
-		const size_t expected = 2 + presets.size() + 1 + (drive_controls.size() - 1);
+		const size_t expected = 2 + 1 + 2 + presets.size() + 1 + (drive_controls.size() - 1);
 
 		if (offered != expected)
 		{
@@ -851,8 +1243,8 @@ int RunUiSelfTest(int frames)
 
 		// The caller disarms; the view follows on the next frame.
 		learning = false;
+		ui.expanded_nodes.clear();
 		view = draw(nullptr, false, &stages);
-		view = click(view.widgets, "expand:1", &stages);
 		widgets = draw(nullptr, false, &stages).widgets;
 	}
 
@@ -897,16 +1289,1438 @@ int RunUiSelfTest(int frames)
 		}
 	}
 
-	// One stage left: removing it would leave the engine with no ports.
+	// One stage left: removing it would leave the engine with no ports. The
+	// shape has to shrink with the chain -- a board drawn from a three-pedal
+	// graph over a one-pedal chain is a state that cannot happen, and testing
+	// against it would prove nothing.
 	{
 		const std::vector<BoardStage> only_one = {{"Amp", "urn:test:amp", false, {}}};
+		const BoardGraphNodes one_node = LinearGraph(1);
+
+		board_graph = &one_node;
+
 		const BoardViewState view = draw(nullptr, false, &only_one);
 
-		if (const WidgetProbe* probe = Find(view.widgets, "remove:0"); !probe || probe->enabled)
+		// Keyed by node id: the one card on the board is node 1.
+		if (const WidgetProbe* probe = Find(view.widgets, "remove:1"); !probe || probe->enabled)
 		{
 			std::fprintf(stderr, "FAIL: removing the only stage should be disabled.\n");
 			return 1;
 		}
+
+		board_graph = &linear;
+	}
+
+	// A split board: the parts only a split has. Drawn and probed rather than
+	// only drawn -- a lane mute or a rejoin that never appears is a feature
+	// that silently isn't there.
+	{
+		board_graph = &split_board;
+
+		// Settling frames: swapping a linear board for a split one changes
+		// almost every position on screen, and the cards are auto-resizing
+		// children that take their new height a frame after they measure it.
+		BoardViewState view;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			view = draw(nullptr, false, &stages);
+		}
+
+		// **The cards start collapsed**, so the board opens showing pedals
+		// rather than settings. Asserted rather than assumed: the summary in a
+		// shut card's header is the only thing standing in for its contents,
+		// and a card that quietly came back open would put the pedals back off
+		// the bottom of the page.
+		if (Find(view.widgets, "mix:a") || Find(view.widgets, "splitter-mode"))
+		{
+			std::fprintf(stderr, "FAIL: the splitter or mixer card came up expanded.\n");
+			return 1;
+		}
+
+		for (const char* card : {"splitter-toggle", "mixer-toggle"})
+		{
+			view = click(view.widgets, card, &stages);
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				view = draw(nullptr, false, &stages);
+			}
+		}
+
+		// The splitter and mixer cards, both lanes' Add stage, the mutes, and
+		// the `1 channel` segment that collapses the whole thing again.
+		const char* required[] = {"mute:a", "mute:b", "mix:a", "mix:b", "learn-mix:a", "learn-mix:b", "add-stage:a",
+			"add-stage:b", "add-stage:post", "splitter-toggle", "mixer-toggle", "channels:0", "channels:1"};
+
+		for (const char* id : required)
+		{
+			if (!Find(view.widgets, id))
+			{
+				std::fprintf(stderr, "FAIL: a split board drew no '%s'.\n", id);
+				return 1;
+			}
+		}
+
+		// A stage inside CHANNEL B expands where it stands and shows its
+		// controls there, which is the whole point of every card being
+		// expandable rather than one panel following a selection.
+		const BoardViewState expanded = click(view.widgets, "expand:2", &stages);
+
+		if (closed_early || expanded.widgets.empty())
+		{
+			std::fprintf(stderr, "FAIL: could not expand a stage inside a lane.\n");
+			return 1;
+		}
+
+		BoardViewState shown;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			shown = draw(nullptr, false, &stages);
+		}
+
+		if (CountWithPrefix(shown.widgets, "control:1:") != drive_controls.size())
+		{
+			std::fprintf(stderr, "FAIL: a stage in a lane drew %zu of %zu control(s).\n",
+				CountWithPrefix(shown.widgets, "control:1:"), drive_controls.size());
+			return 1;
+		}
+
+		// ...and its controls move, and report the stage they belong to. A
+		// card that drew the right controls but reported someone else's index
+		// would be the exact failure a lane makes possible: everything in
+		// CHANNEL A comes first in signal order, so a stage in B is the one
+		// whose position has to be counted rather than assumed.
+		const BoardViewState moved = press(shown.widgets, "control:1:gain", &stages);
+
+		if (moved.control_stage != 1 || moved.control_symbol != "gain")
+		{
+			std::fprintf(stderr, "FAIL: a control in channel B reported stage %zu '%s', expected 1 'gain'.\n",
+				moved.control_stage, moved.control_symbol.c_str());
+			return 1;
+		}
+
+		if (!(moved.control_value > -17.0f && moved.control_value < 18.0f))
+		{
+			std::fprintf(stderr, "FAIL: the middle of a channel B control gave %g, expected well inside -18..18.\n",
+				static_cast<double>(moved.control_value));
+			return 1;
+		}
+
+		// And a binding can be learned on it, addressed by the same index.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			shown = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState learn_in_lane = click(shown.widgets, "learn-bypass:1", &stages);
+
+		if (learn_in_lane.learn_request.target != LearnTarget::ToggleBypass || learn_in_lane.learn_request.stage != 1)
+		{
+			std::fprintf(stderr, "FAIL: learning bypass in channel B asked for target=%d stage=%zu.\n",
+				static_cast<int>(learn_in_lane.learn_request.target), learn_in_lane.learn_request.stage);
+			return 1;
+		}
+
+		// The card stays expanded for what follows, as it did before there was
+		// anything to learn on it. Collapsing here would be tidier to read and
+		// worse to run: an expanded card is tall, the mixer sits under the
+		// lanes, and putting one away moves everything below it by that much
+		// through three levels of auto-resizing child -- more settling than
+		// the two frames every other step needs, for no assertion's benefit.
+
+		// Muting a channel names the channel, not the stage in it.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			shown = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState muted = click(shown.widgets, "mute:b", &stages);
+
+		if (muted.graph_edit != GraphEdit::ToggleMute || muted.graph_edit_node != 10 || muted.graph_edit_branch != 1)
+		{
+			std::fprintf(stderr, "FAIL: muting channel B asked for edit=%d node=%u lane=%u.\n",
+				static_cast<int>(muted.graph_edit), muted.graph_edit_node, muted.graph_edit_branch);
+			return 1;
+		}
+
+		// A lane's level. Pressing the middle of the slider is the closest a
+		// probe gets to a drag, and it is the claim that matters: the edit is
+		// reported *while the mouse is on it*, as SetLaneGain, which is the
+		// one shape edit the caller applies without a rebuild (SF-72). A
+		// slider that reported on release, or reported anything else, would
+		// cost a crossfade per frame of a drag.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			shown = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState level = press(shown.widgets, "mix:a", &stages);
+
+		if (level.graph_edit != GraphEdit::SetLaneGain || level.graph_edit_node != 10 || level.graph_edit_branch != 0)
+		{
+			std::fprintf(stderr, "FAIL: the channel A level asked for edit=%d node=%u lane=%u.\n",
+				static_cast<int>(level.graph_edit), level.graph_edit_node, level.graph_edit_branch);
+			return 1;
+		}
+
+		// The middle of a -60..+6 dB slider, give or take pixel rounding. What
+		// is being ruled out is a level reported in some other unit, or the
+		// 0..1 a slider left on its defaults would give.
+		if (!(level.graph_edit_gain_db > -45.0f && level.graph_edit_gain_db < -8.0f))
+		{
+			std::fprintf(stderr, "FAIL: the middle of the channel A level gave %g dB, expected mid-range of -60..+6.\n",
+				static_cast<double>(level.graph_edit_gain_db));
+			return 1;
+		}
+
+		// Channel B is muted in this board, and a muted lane's level is drawn
+		// disabled rather than hidden -- the level it will come back at is
+		// still worth reading, but it is not draggable while it is silent.
+		const WidgetProbe* muted_level = Find(shown.widgets, "mix:b");
+
+		if (!muted_level || muted_level->enabled)
+		{
+			std::fprintf(stderr, "FAIL: a muted channel's level should be drawn but not draggable.\n");
+			return 1;
+		}
+
+		// Each lane's level can be learned, and the button names the lane
+		// rather than the split it is currently on -- a binding outlives the
+		// preset it was made on.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			shown = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState learn_b = click(shown.widgets, "learn-mix:b", &stages);
+
+		if (learn_b.learn_request.target != LearnTarget::SetMixerLevel || learn_b.learn_request.symbol != "b")
+		{
+			std::fprintf(stderr, "FAIL: the channel B learn button asked for target=%d symbol='%s'.\n",
+				static_cast<int>(learn_b.learn_request.target), learn_b.learn_request.symbol.c_str());
+			return 1;
+		}
+
+		// The range goes with the request, or a pedal sweeps 0..1 dB.
+		if (learn_b.learn_request.minimum != -60.0f || learn_b.learn_request.maximum != 6.0f)
+		{
+			std::fprintf(stderr, "FAIL: the channel B learn button asked for the range %g..%g dB.\n",
+				static_cast<double>(learn_b.learn_request.minimum), static_cast<double>(learn_b.learn_request.maximum));
+			return 1;
+		}
+
+		// The splitter card (SF-75). Everything on it is planned into the
+		// chain, so everything on it asks for the same SetSplitter edit --
+		// what is asserted here is that each control changes its own field and
+		// leaves the rest of the splitter as it found it. A control that sent
+		// back a default-constructed splitter would silently reset three
+		// settings every time a fourth was touched.
+		{
+			BoardViewState card;
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				card = draw(nullptr, false, &stages);
+			}
+
+			// Full range is the fixture's mode, so the crossover frequency and
+			// the stereo sources are not drawn: per-mode contents, not every
+			// control at once with most of them greyed.
+			if (!Find(card.widgets, "splitter-mode") || !Find(card.widgets, "send:a") ||
+				!Find(card.widgets, "send:b"))
+			{
+				std::fprintf(stderr, "FAIL: the splitter card drew no mode select or no sends.\n");
+				return 1;
+			}
+
+			if (Find(card.widgets, "splitter-freq") || Find(card.widgets, "splitter-src:a"))
+			{
+				std::fprintf(stderr, "FAIL: full range drew a crossover frequency or a stereo source.\n");
+				return 1;
+			}
+
+			// A send reports on release, not while dragging: it is planned
+			// into the chain, so every report is a rebuild. `click` is press
+			// *and* release, which is what a slider needs to report at all.
+			const BoardViewState sent = click(card.widgets, "send:a", &stages);
+
+			if (sent.graph_edit != GraphEdit::SetSplitter || sent.graph_edit_node != 10)
+			{
+				std::fprintf(stderr, "FAIL: the channel A send asked for edit=%d node=%u.\n",
+					static_cast<int>(sent.graph_edit), sent.graph_edit_node);
+				return 1;
+			}
+
+			// The fixture sends lane A -18 dB, so the middle of the slider is a
+			// real move, and it lands near the centre of -24..+24.
+			if (!(sent.graph_edit_splitter.send_db[0] > -8.0f && sent.graph_edit_splitter.send_db[0] < 8.0f))
+			{
+				std::fprintf(stderr, "FAIL: the channel A send reported %g dB, expected mid-range of -24..24.\n",
+					static_cast<double>(sent.graph_edit_splitter.send_db[0]));
+				return 1;
+			}
+
+			// The other lane's send, the mode and the frequency came back
+			// untouched. This is the check that catches a control which
+			// rebuilds the splitter instead of amending it.
+			if (sent.graph_edit_splitter.send_db[1] != 0.0f ||
+				sent.graph_edit_splitter.mode != BoardSplitterMode::Full ||
+				sent.graph_edit_splitter.frequency != 800.0f)
+			{
+				std::fprintf(stderr, "FAIL: moving one send also changed lane B (%g dB), the mode (%d) or the "
+									 "frequency (%g Hz).\n",
+					static_cast<double>(sent.graph_edit_splitter.send_db[1]),
+					static_cast<int>(sent.graph_edit_splitter.mode),
+					static_cast<double>(sent.graph_edit_splitter.frequency));
+				return 1;
+			}
+
+			// The mode select. Its rows exist only while the dropdown is open,
+			// and a popup reports positions from the frame it opened in while
+			// Dear ImGui may still move it on its second -- hence the settling
+			// frames before aiming at a row.
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				card = draw(nullptr, false, &stages);
+			}
+
+			const BoardViewState opened = click(card.widgets, "splitter-mode", &stages);
+
+			if (closed_early || opened.widgets.empty())
+			{
+				std::fprintf(stderr, "FAIL: could not open the splitter mode select.\n");
+				return 1;
+			}
+
+			BoardViewState rows;
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				rows = draw(nullptr, false, &stages);
+			}
+
+			if (!Find(rows.widgets, "splitter-mode:crossover"))
+			{
+				std::fprintf(stderr, "FAIL: the open mode select offered no crossover.\n");
+				return 1;
+			}
+
+			const BoardViewState chosen = click(rows.widgets, "splitter-mode:crossover", &stages);
+
+			if (chosen.graph_edit != GraphEdit::SetSplitter ||
+				chosen.graph_edit_splitter.mode != BoardSplitterMode::Crossover)
+			{
+				std::fprintf(stderr, "FAIL: choosing crossover asked for edit=%d mode=%d.\n",
+					static_cast<int>(chosen.graph_edit), static_cast<int>(chosen.graph_edit_splitter.mode));
+				return 1;
+			}
+		}
+
+		// The same card against a board that *is* in crossover mode, and one
+		// in stereo mode: per-mode contents means each mode draws its own, and
+		// the only way to see that is to be in it.
+		{
+			BoardGraphNodes crossover_board = SplitGraph();
+			crossover_board[1].splitter.mode = BoardSplitterMode::Crossover;
+			crossover_board[1].splitter.frequency = 250.0f;
+
+			board_graph = &crossover_board;
+
+			BoardViewState card;
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				card = draw(nullptr, false, &stages);
+			}
+
+			if (!Find(card.widgets, "splitter-freq"))
+			{
+				std::fprintf(stderr, "FAIL: crossover mode drew no frequency control.\n");
+				return 1;
+			}
+
+			if (Find(card.widgets, "splitter-src:a"))
+			{
+				std::fprintf(stderr, "FAIL: crossover mode drew a stereo source select.\n");
+				return 1;
+			}
+
+			const BoardViewState tuned = click(card.widgets, "splitter-freq", &stages);
+
+			if (tuned.graph_edit != GraphEdit::SetSplitter ||
+				tuned.graph_edit_splitter.mode != BoardSplitterMode::Crossover)
+			{
+				std::fprintf(stderr, "FAIL: the crossover frequency asked for edit=%d mode=%d.\n",
+					static_cast<int>(tuned.graph_edit), static_cast<int>(tuned.graph_edit_splitter.mode));
+				return 1;
+			}
+
+			if (tuned.graph_edit_splitter.frequency == 250.0f)
+			{
+				std::fprintf(stderr, "FAIL: clicking the middle of the crossover slider left it at 250 Hz.\n");
+				return 1;
+			}
+
+			BoardGraphNodes stereo_board = SplitGraph();
+			stereo_board[1].splitter.mode = BoardSplitterMode::Stereo;
+
+			board_graph = &stereo_board;
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				card = draw(nullptr, false, &stages);
+			}
+
+			if (!Find(card.widgets, "splitter-src:a") || !Find(card.widgets, "splitter-src:b"))
+			{
+				std::fprintf(stderr, "FAIL: stereo mode drew no source select.\n");
+				return 1;
+			}
+
+			if (Find(card.widgets, "splitter-freq"))
+			{
+				std::fprintf(stderr, "FAIL: stereo mode drew a crossover frequency.\n");
+				return 1;
+			}
+
+			board_graph = &split_board;
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				card = draw(nullptr, false, &stages);
+			}
+		}
+
+		// `1 channel` is the only control that collapses a split, and it has
+		// to name the split it is collapsing. It sits above everything the
+		// clicks so far have moved, so its position is stable -- but settle
+		// anyway rather than depend on that staying true.
+		BoardViewState settled;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			settled = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState rejoined = click(settled.widgets, "channels:0", &stages);
+
+		if (rejoined.graph_edit != GraphEdit::Rejoin || rejoined.graph_edit_node != 10)
+		{
+			std::fprintf(stderr, "FAIL: collapsing to one channel asked for edit=%d node=%u.\n",
+				static_cast<int>(rejoined.graph_edit), rejoined.graph_edit_node);
+
+			return 1;
+		}
+
+		// Add stage inside a channel has to carry *which* channel, or a stage
+		// added to B would land in A.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			settled = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState in_lane = click(settled.widgets, "add-stage:b", &stages);
+
+		if (closed_early || in_lane.widgets.empty())
+		{
+			std::fprintf(stderr, "FAIL: could not press Add stage inside a channel.\n");
+			return 1;
+		}
+
+		if (!ui.pending_slot_valid || ui.pending_slot.split != 10 || ui.pending_slot.branch != 1)
+		{
+			std::fprintf(stderr, "FAIL: Add stage in channel B remembered split=%u lane=%u.\n", ui.pending_slot.split,
+				ui.pending_slot.branch);
+			return 1;
+		}
+
+		board_graph = &linear;
+		ui.pending_slot_valid = false;
+	}
+
+	// **Two widgets sharing one Dear ImGui id**, checked across every screen
+	// and every modal.
+	//
+	// ImGui identifies a widget by its label and the id stack above it, so two
+	// buttons with the same label at the same level are *one widget*: only one
+	// of them responds, and the other looks like a button that does nothing.
+	// Nothing about that shows in a screenshot, and no other assertion here
+	// would catch it -- the probes find both by name, and clicking either
+	// reports the edit the surviving one makes.
+	//
+	// So the ids are compared directly. Each probe records the id ImGui gave
+	// the item beside it, which makes this one pass over one frame's widgets
+	// per screen rather than a hover of each in turn -- and it covers every
+	// widget, not only the ones a mouse can reach.
+	//
+	// It found the `Add stage` buttons, which are all labelled the same. A
+	// linear board draws one and never notices; a split board draws four.
+	int conflicts = 0;
+
+	{
+		auto check = [&](const char* what, const std::vector<WidgetProbe>& probes)
+		{
+			for (size_t i = 0; i < probes.size(); ++i)
+			{
+				if (probes[i].imgui_id == 0)
+				{
+					continue;
+				}
+
+				for (size_t j = i + 1; j < probes.size(); ++j)
+				{
+					if (probes[i].imgui_id != probes[j].imgui_id)
+					{
+						continue;
+					}
+
+					std::fprintf(stderr, "FAIL: on the %s, '%s' and '%s' are one widget -- same ImGui id.\n", what,
+						probes[i].id.c_str(), probes[j].id.c_str());
+
+					++conflicts;
+				}
+			}
+		};
+
+		BoardViewState swept;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			swept = draw(nullptr, false, &stages);
+		}
+
+		if (Find(swept.widgets, "browser-cancel:0"))
+		{
+			swept = click(swept.widgets, "browser-cancel:0", &stages);
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				swept = draw(nullptr, false, &stages);
+			}
+		}
+
+		check("board", swept.widgets);
+
+		ui.live_screen = true;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			swept = draw(nullptr, false, &stages);
+		}
+
+		check("live screen", swept.widgets);
+		ui.live_screen = false;
+
+		// The split board, which is where a board draws four of anything.
+		board_graph = &split_board;
+		ui.SetExpanded(1, true);
+		ui.SetExpanded(2, true);
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			swept = draw(nullptr, false, &stages);
+		}
+
+		check("split board", swept.widgets);
+
+		// And each modal, which draws over a board that is still there.
+		struct ModalCase
+		{
+			const char* what;
+			bool* open;
+			const char* close;
+		};
+
+		const ModalCase modals[] = {
+			{"MIDI map", &ui.midi_map_open, "midi-map:close"},
+			{"tuner", &ui.tuner_open, "tuner:close"},
+			{"metronome", &ui.metronome_open, "metronome:close"},
+		};
+
+		for (const ModalCase& one : modals)
+		{
+			*one.open = true;
+
+			for (int i = 0; i < kSettleFrames + 1; ++i)
+			{
+				swept = draw(nullptr, false, &stages);
+			}
+
+			check(one.what, swept.widgets);
+
+			// Dismissed through its own Close, not by clearing the flag.
+			// Clearing it only stops the modal being *drawn*: the popup stays
+			// open on ImGui's stack, and a stale one blocks every click on the
+			// board behind it for the rest of the run.
+			if (Find(swept.widgets, one.close))
+			{
+				swept = click(swept.widgets, one.close, &stages);
+			}
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				swept = draw(nullptr, false, &stages);
+			}
+		}
+
+		ui.plugin_ui_stage = 1;
+
+		for (int i = 0; i < kSettleFrames + 1; ++i)
+		{
+			swept = draw(nullptr, false, &stages);
+		}
+
+		check("plugin UI", swept.widgets);
+
+		if (Find(swept.widgets, "plugin-ui:close"))
+		{
+			swept = click(swept.widgets, "plugin-ui:close", &stages);
+		}
+
+		ui.SetExpanded(1, false);
+		ui.SetExpanded(2, false);
+		board_graph = &linear;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			swept = draw(nullptr, false, &stages);
+		}
+
+		if (conflicts > 0)
+		{
+			return 1;
+		}
+	}
+
+	// The live screen (SF-77): the same running chain, drawn to be read across
+	// a stage. What is checked is that it *is* the same chain -- switching to
+	// it and back changes what is drawn and nothing about what is playing --
+	// and that a tile switches presets through the same request the board's
+	// own list uses.
+	{
+		BoardViewState board;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			board = draw(nullptr, false, &stages);
+		}
+
+		if (Find(board.widgets, "browser-cancel:0"))
+		{
+			board = click(board.widgets, "browser-cancel:0", &stages);
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				board = draw(nullptr, false, &stages);
+			}
+		}
+
+		if (!Find(board.widgets, "screen:0") || !Find(board.widgets, "screen:1"))
+		{
+			std::fprintf(stderr, "FAIL: the header drew no Board|Live control.\n");
+			return 1;
+		}
+
+		board = click(board.widgets, "screen:1", &stages);
+
+		if (closed_early || !ui.live_screen)
+		{
+			std::fprintf(stderr, "FAIL: pressing Live did not switch screen.\n");
+			return 1;
+		}
+
+		BoardViewState live;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			live = draw(nullptr, false, &stages);
+		}
+
+		// One tile per preset, plus the two stomps.
+		if (CountWithPrefix(live.widgets, "live-preset:") != presets.size())
+		{
+			std::fprintf(stderr, "FAIL: the live screen drew %zu tile(s) for %zu preset(s).\n",
+				CountWithPrefix(live.widgets, "live-preset:"), presets.size());
+			return 1;
+		}
+
+		if (!Find(live.widgets, "live:prev") || !Find(live.widgets, "live:next"))
+		{
+			std::fprintf(stderr, "FAIL: the live screen drew no Prev/Next.\n");
+			return 1;
+		}
+
+		// The board is *not* drawn behind it: this replaces the body rather
+		// than floating over it, so none of the board's widgets exist. A
+		// screen that left the chain drawn underneath would be a screen whose
+		// clicks could reach it.
+		if (CountWithPrefix(live.widgets, "expand:") != 0 || Find(live.widgets, "add-stage:pre"))
+		{
+			std::fprintf(stderr, "FAIL: the board was still drawn behind the live screen.\n");
+			return 1;
+		}
+
+		// A tile asks for its preset, through the same field the sidebar's
+		// list uses -- one way to say "play this one".
+		const BoardViewState picked = click(live.widgets, "live-preset:0", &stages);
+
+		if (picked.requested_preset != 0)
+		{
+			std::fprintf(stderr, "FAIL: a live tile asked for preset %zu, expected 0.\n", picked.requested_preset);
+			return 1;
+		}
+
+		// And Next asks for the one after whatever is playing, wrapping.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			live = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState stepped = click(live.widgets, "live:next", &stages);
+
+		if (stepped.requested_preset != (starting_preset + 1) % presets.size())
+		{
+			std::fprintf(stderr, "FAIL: live Next asked for preset %zu, expected %zu.\n", stepped.requested_preset,
+				(starting_preset + 1) % presets.size());
+			return 1;
+		}
+
+		// Back to the board, with the same preset playing as before -- the
+		// screen switch is a UI fact and touches nothing else.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			live = draw(nullptr, false, &stages);
+		}
+
+		live = click(live.widgets, "screen:0", &stages);
+
+		if (ui.live_screen)
+		{
+			std::fprintf(stderr, "FAIL: pressing Board did not switch back.\n");
+			return 1;
+		}
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			board = draw(nullptr, false, &stages);
+		}
+
+		if (board.current_preset != starting_preset)
+		{
+			std::fprintf(stderr, "FAIL: a trip through the live screen changed the playing preset to %zu.\n",
+				board.current_preset);
+			return 1;
+		}
+
+		if (CountWithPrefix(board.widgets, "expand:") == 0)
+		{
+			std::fprintf(stderr, "FAIL: the board did not come back.\n");
+			return 1;
+		}
+	}
+
+	// The plugin-UI modal (SF-79). The claim worth checking is that the
+	// controls in it are *that stage's* and that moving one is reported the
+	// same way the card reports it -- the modal shares the card's rows rather
+	// than growing a second set, and this is what says so.
+	{
+		BoardViewState card;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			card = draw(nullptr, false, &stages);
+		}
+
+		// Close whatever the previous phase left up, then expand the stage
+		// that has an editor to talk about.
+		if (Find(card.widgets, "browser-cancel:0"))
+		{
+			card = click(card.widgets, "browser-cancel:0", &stages);
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				card = draw(nullptr, false, &stages);
+			}
+		}
+
+		// Set rather than clicked: the split board left this same node
+		// expanded, and a click here would toggle it *shut*. Which state a
+		// click lands in depends on what an earlier phase left behind, and
+		// that is not a thing this phase should be asserting about.
+		//
+		// **Two** cards, one with an editor and one without. The card body is
+		// only drawn when it is expanded, so a stage left collapsed proves
+		// nothing about what it would have offered -- an assertion that no
+		// button appeared for it would pass just as happily if every plugin
+		// grew one.
+		ui.SetExpanded(1, true);
+		ui.SetExpanded(2, true);
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			card = draw(nullptr, false, &stages);
+		}
+
+		// Stage 1 declares an editor; stage 0, expanded beside it, does not
+		// and must not be offering a button that would open a modal about
+		// nothing.
+		if (!Find(card.widgets, "plugin-ui:1"))
+		{
+			std::fprintf(stderr, "FAIL: a plugin with its own editor drew no 'Open plugin UI'.\n");
+			return 1;
+		}
+
+		if (Find(card.widgets, "plugin-ui:0"))
+		{
+			std::fprintf(stderr, "FAIL: a plugin with no editor was offered one anyway.\n");
+			return 1;
+		}
+
+		const BoardViewState opened = click(card.widgets, "plugin-ui:1", &stages);
+
+		if (closed_early || ui.plugin_ui_stage != 1)
+		{
+			std::fprintf(stderr, "FAIL: opening the plugin UI left it showing stage %zu.\n", ui.plugin_ui_stage);
+			return 1;
+		}
+
+		(void)opened;
+
+		BoardViewState modal;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			modal = draw(nullptr, false, &stages);
+		}
+
+		if (!Find(modal.widgets, "plugin-ui:close"))
+		{
+			std::fprintf(stderr, "FAIL: the plugin UI modal did not open.\n");
+			return 1;
+		}
+
+		// Its controls are stage 1's, and there are as many as the stage has.
+		// The card behind it is expanded too and draws the same rows, which is
+		// why the modal's answer to a prefix of their own: two widgets under one
+		// name would mean a test clicking whichever came first, and with a
+		// modal up that is the one nobody can reach.
+		if (CountWithPrefix(modal.widgets, "plugin-ui:control:1:") != drive_controls.size())
+		{
+			std::fprintf(stderr, "FAIL: the plugin UI drew %zu control probe(s) for a stage with %zu control(s).\n",
+				CountWithPrefix(modal.widgets, "plugin-ui:control:1:"), drive_controls.size());
+			return 1;
+		}
+
+		// And moving one reports through the same fields the card uses, so it
+		// reaches the running plugin by a path that already works.
+		const BoardViewState moved = press(modal.widgets, "plugin-ui:control:1:gain", &stages);
+
+		if (moved.control_stage != 1 || moved.control_symbol != "gain")
+		{
+			std::fprintf(stderr, "FAIL: a control in the plugin UI reported stage %zu '%s'.\n", moved.control_stage,
+				moved.control_symbol.c_str());
+			return 1;
+		}
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			modal = draw(nullptr, false, &stages);
+		}
+
+		modal = click(modal.widgets, "plugin-ui:close", &stages);
+
+		if (ui.plugin_ui_stage != kNoPreset)
+		{
+			std::fprintf(stderr, "FAIL: closing the plugin UI left it showing stage %zu.\n", ui.plugin_ui_stage);
+			return 1;
+		}
+
+		// Put the cards away again so what follows sees the board it expects --
+		// set, not clicked, for the same reason as above.
+		ui.SetExpanded(1, false);
+		ui.SetExpanded(2, false);
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			draw(nullptr, false, &stages);
+		}
+	}
+
+	// The noise gate's card (SF-85). The DSP is `noise_gate_test`'s; what is
+	// left here is that each control asks for its own thing and only its own
+	// thing, and that the card asks rather than does -- the gate lives on the
+	// preset and runs on the audio thread, and the view touches neither.
+	{
+		BoardViewState card;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			card = draw(nullptr, false, &stages);
+		}
+
+		if (Find(card.widgets, "browser-cancel:0"))
+		{
+			card = click(card.widgets, "browser-cancel:0", &stages);
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				card = draw(nullptr, false, &stages);
+			}
+		}
+
+		// Collapsed to start with, like the splitter and the mixer: the board
+		// opens on pedals, not on settings. Its header still says what it is
+		// set to, which is what makes closing it cost nothing to read.
+		if (Find(card.widgets, "gate:threshold"))
+		{
+			std::fprintf(stderr, "FAIL: the gate card came up expanded.\n");
+			return 1;
+		}
+
+		if (!Find(card.widgets, "gate-toggle"))
+		{
+			std::fprintf(stderr, "FAIL: a collapsed gate card drew no header to open it with.\n");
+			return 1;
+		}
+
+		card = click(card.widgets, "gate-toggle", &stages);
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			card = draw(nullptr, false, &stages);
+		}
+
+		const char* required[] = {"gate-toggle", "gate:enabled", "gate:threshold", "gate:release"};
+
+		for (const char* id : required)
+		{
+			if (!Find(card.widgets, id))
+			{
+				std::fprintf(stderr, "FAIL: the gate card drew no '%s'.\n", id);
+				return 1;
+			}
+		}
+
+		// Disabled, the two sliders are drawn but not draggable -- the same
+		// rule a muted lane's level follows. The value they will take when it
+		// comes on is still worth reading.
+		const WidgetProbe* threshold = Find(card.widgets, "gate:threshold");
+
+		if (!threshold || threshold->enabled)
+		{
+			std::fprintf(stderr, "FAIL: a disabled gate's threshold should be shown but not draggable.\n");
+			return 1;
+		}
+
+		const BoardViewState toggled = click(card.widgets, "gate:enabled", &stages);
+
+		if (!toggled.gate_toggle_requested)
+		{
+			std::fprintf(stderr, "FAIL: the gate switch asked for nothing.\n");
+			return 1;
+		}
+
+		// It asked; it did not do. The gate is a preset value and the view
+		// has no business writing one.
+		if (gate.enabled)
+		{
+			std::fprintf(stderr, "FAIL: the view enabled the gate itself.\n");
+			return 1;
+		}
+
+		// Enabled, and off the slider midpoints, so that clicking the centre
+		// of either is a real change rather than a click that reports nothing.
+		gate = BoardGate{true, -64.0f, 1200.0f, 1.0f};
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			card = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState moved = press(card.widgets, "gate:threshold", &stages);
+
+		if (!(moved.gate_threshold_request > -70.0f && moved.gate_threshold_request < -20.0f))
+		{
+			std::fprintf(stderr, "FAIL: the threshold asked for %g dB, expected inside -70..-20.\n",
+				static_cast<double>(moved.gate_threshold_request));
+			return 1;
+		}
+
+		// One control, one request. A slider that reported its neighbours too
+		// would overwrite settings nobody touched -- and with the gate on a
+		// preset, that is a saved file quietly changing.
+		if (!std::isnan(moved.gate_release_request) || moved.gate_toggle_requested)
+		{
+			std::fprintf(stderr, "FAIL: moving the threshold also asked for a release or a toggle.\n");
+			return 1;
+		}
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			card = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState released = press(card.widgets, "gate:release", &stages);
+
+		if (!(released.gate_release_request >= 20.0f && released.gate_release_request <= 2000.0f))
+		{
+			std::fprintf(stderr, "FAIL: the release asked for %g ms, expected inside 20..2000.\n",
+				static_cast<double>(released.gate_release_request));
+			return 1;
+		}
+
+		if (!std::isnan(released.gate_threshold_request))
+		{
+			std::fprintf(stderr, "FAIL: moving the release also asked for a threshold.\n");
+			return 1;
+		}
+
+		// Collapsing the card is not a preset edit.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			card = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState collapsed = click(card.widgets, "gate-toggle", &stages);
+
+		if (ui.gate_open)
+		{
+			std::fprintf(stderr, "FAIL: the gate card did not collapse.\n");
+			return 1;
+		}
+
+		if (collapsed.gate_toggle_requested || !std::isnan(collapsed.gate_threshold_request))
+		{
+			std::fprintf(stderr, "FAIL: collapsing the gate card asked for a preset edit.\n");
+			return 1;
+		}
+
+		// Left as it was found: closed.
+		ui.gate_open = false;
+		gate = BoardGate();
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			draw(nullptr, false, &stages);
+		}
+	}
+
+	// The metronome (SF-82). The timing is `metronome_test`'s -- clicks land
+	// on exact samples there. What is left here is that each control asks for
+	// its own thing and asks the *caller* rather than doing it: the click runs
+	// on the audio thread, and the view never touches it.
+	{
+		BoardViewState before;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			before = draw(nullptr, false, &stages);
+		}
+
+		if (Find(before.widgets, "browser-cancel:0"))
+		{
+			before = click(before.widgets, "browser-cancel:0", &stages);
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				before = draw(nullptr, false, &stages);
+			}
+		}
+
+		const BoardViewState asked = click(before.widgets, "menu:metronome", &stages);
+
+		if (!asked.metronome_requested)
+		{
+			std::fprintf(stderr, "FAIL: the header's Metronome button asked for nothing.\n");
+			return 1;
+		}
+
+		ui.metronome_open = true;
+		metronome = BoardMetronome{false, 120.0f, 4, 0.5f, 0, "", ""};
+
+		BoardViewState open;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			open = draw(nullptr, false, &stages);
+		}
+
+		const char* required[] = {"metronome:close", "metronome:toggle", "metronome:tap", "metronome:tempo",
+			"metronome:level", "metronome:signature", "learn-metronome:toggle", "learn-metronome:tempo"};
+
+		for (const char* id : required)
+		{
+			if (!Find(open.widgets, id))
+			{
+				std::fprintf(stderr, "FAIL: the metronome drew no '%s'.\n", id);
+				return 1;
+			}
+		}
+
+		// Start asks; it does not start anything itself.
+		const BoardViewState started = click(open.widgets, "metronome:toggle", &stages);
+
+		if (!started.metronome_toggle_requested)
+		{
+			std::fprintf(stderr, "FAIL: Start asked for nothing.\n");
+			return 1;
+		}
+
+		if (metronome.running)
+		{
+			std::fprintf(stderr, "FAIL: the view started the click itself.\n");
+			return 1;
+		}
+
+		// Tempo moves, and reports a BPM rather than a fraction.
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			open = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState tempo = press(open.widgets, "metronome:tempo", &stages);
+
+		if (!(tempo.metronome_tempo_request > 100.0f && tempo.metronome_tempo_request < 180.0f))
+		{
+			std::fprintf(stderr, "FAIL: the middle of the tempo slider asked for %g BPM, expected mid-40..240.\n",
+				static_cast<double>(tempo.metronome_tempo_request));
+			return 1;
+		}
+
+		// ...and it did not also ask for a level or a time signature. One
+		// control, one request: a slider that reported its neighbours too
+		// would overwrite settings nobody touched.
+		if (!std::isnan(tempo.metronome_level_request) || tempo.metronome_beats_request != 0)
+		{
+			std::fprintf(stderr, "FAIL: moving the tempo also asked for a level or a time signature.\n");
+			return 1;
+		}
+
+		// The level reports 0..1, not the percentage it displays.
+		//
+		// Moved off the midpoint first: the slider runs 0..100% and the
+		// fixture sits at 50, so clicking its centre would land the handle
+		// exactly where it already is and report nothing at all -- a check
+		// that asserted nothing while looking like it asserted something.
+		metronome.level = 0.15f;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			open = draw(nullptr, false, &stages);
+		}
+
+		const BoardViewState level = press(open.widgets, "metronome:level", &stages);
+
+		if (!(level.metronome_level_request >= 0.0f && level.metronome_level_request <= 1.0f))
+		{
+			std::fprintf(stderr, "FAIL: the level asked for %g, expected 0..1 rather than a percentage.\n",
+				static_cast<double>(level.metronome_level_request));
+			return 1;
+		}
+
+		// A running click shows its beat, and the dots follow the *engine's*
+		// count rather than one the view keeps.
+		metronome = BoardMetronome{true, 96.0f, 3, 0.8f, 2, "CC 64", "CC 11"};
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			open = draw(nullptr, false, &stages);
+		}
+
+		if (!Find(open.widgets, "metronome:toggle"))
+		{
+			std::fprintf(stderr, "FAIL: a running metronome drew no Stop.\n");
+			return 1;
+		}
+
+		open = click(open.widgets, "metronome:close", &stages);
+
+		if (ui.metronome_open)
+		{
+			std::fprintf(stderr, "FAIL: closing the metronome left it open.\n");
+			return 1;
+		}
+
+		metronome = BoardMetronome();
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			draw(nullptr, false, &stages);
+		}
+	}
+
+	// The tuner (SF-81). The arithmetic is `pitch_detect_test`'s; what is left
+	// here is that the modal says what it is doing to the board, that the
+	// needle's verdict follows the reading, and that opening it is a *request*
+	// -- the caller mutes, because muting is engine state and the view has no
+	// business reaching for it.
+	{
+		BoardViewState before;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			before = draw(nullptr, false, &stages);
+		}
+
+		if (Find(before.widgets, "browser-cancel:0"))
+		{
+			before = click(before.widgets, "browser-cancel:0", &stages);
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				before = draw(nullptr, false, &stages);
+			}
+		}
+
+		const BoardViewState asked = click(before.widgets, "menu:tuner", &stages);
+
+		if (!asked.tuner_requested)
+		{
+			std::fprintf(stderr, "FAIL: the header's Tuner button asked for nothing.\n");
+			return 1;
+		}
+
+		// **A request, not an opening.** If the view opened its own tuner the
+		// board would be unmuted behind it, which is the one thing this modal
+		// must never be.
+		if (ui.tuner_open)
+		{
+			std::fprintf(stderr, "FAIL: the view opened the tuner itself, without the caller muting anything.\n");
+			return 1;
+		}
+
+		ui.tuner_open = true;
+
+		// In tune, well out of tune, and nothing heard at all -- the three
+		// states the needle has.
+		tuner = BoardTuner{"A4", 440.0f, 1.0f, true};
+
+		BoardViewState open;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			open = draw(nullptr, false, &stages);
+		}
+
+		if (!Find(open.widgets, "tuner:close"))
+		{
+			std::fprintf(stderr, "FAIL: the tuner did not open.\n");
+			return 1;
+		}
+
+		tuner = BoardTuner{"E2", 80.0f, -32.0f, true};
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			open = draw(nullptr, false, &stages);
+		}
+
+		// A reading past the ends of the track: the needle is clamped, and a
+		// board that tried to draw it off the end would be pointing at
+		// nothing. Drawn rather than asserted -- what matters is that it does
+		// not fall over.
+		tuner = BoardTuner{"A#4", 466.0f, 240.0f, true};
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			open = draw(nullptr, false, &stages);
+		}
+
+		tuner = BoardTuner();
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			open = draw(nullptr, false, &stages);
+		}
+
+		open = click(open.widgets, "tuner:close", &stages);
+
+		if (ui.tuner_open)
+		{
+			std::fprintf(stderr, "FAIL: closing the tuner left it open -- the board would stay muted.\n");
+			return 1;
+		}
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			draw(nullptr, false, &stages);
+		}
+	}
+
+	// The MIDI mappings modal (SF-78). Read-only, so what there is to check is
+	// that it opens, shows a row per binding, and closes -- and that its count
+	// is the sidebar's count, since two renderings of one list that disagree
+	// are worse than either alone.
+	{
+		// The last thing the split board did was press an Add stage, which
+		// leaves the plugin browser up -- and a modal makes the header
+		// unclickable, which is exactly what it is for. Put it away first, or
+		// this reads as the button being broken.
+		BoardViewState before;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			before = draw(nullptr, false, &stages);
+		}
+
+		if (Find(before.widgets, "browser-cancel:0"))
+		{
+			before = click(before.widgets, "browser-cancel:0", &stages);
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				before = draw(nullptr, false, &stages);
+			}
+		}
+
+		if (Find(before.widgets, "midi-map:close"))
+		{
+			std::fprintf(stderr, "FAIL: the mappings modal was showing before anything opened it.\n");
+			return 1;
+		}
+
+		const BoardViewState asked = click(before.widgets, "menu:midi-map", &stages);
+
+		if (!asked.midi_map_requested)
+		{
+			std::fprintf(stderr, "FAIL: the header's MIDI map button asked for nothing.\n");
+			return 1;
+		}
+
+		// The caller is what turns the request into an open modal, and here
+		// that caller is this test.
+		ui.midi_map_open = true;
+
+		BoardViewState open;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			open = draw(nullptr, false, &stages);
+		}
+
+		if (!Find(open.widgets, "midi-map:close"))
+		{
+			std::fprintf(stderr, "FAIL: the mappings modal did not open.\n");
+			return 1;
+		}
+
+		// One row per binding, and the same number the sidebar shows. Two
+		// renderings of one list that disagreed would leave a player counting
+		// pedals against a figure that was never about them.
+		const size_t rows = CountWithPrefix(open.widgets, "midi-map:row:");
+
+		if (rows != midi_bindings.size() || rows != open.midi_bindings)
+		{
+			std::fprintf(stderr, "FAIL: the mappings table drew %zu row(s) for %zu binding(s), and the sidebar "
+								 "says %zu.\n",
+				rows, midi_bindings.size(), open.midi_bindings);
+			return 1;
+		}
+
+		const BoardViewState closed = click(open.widgets, "midi-map:close", &stages);
+
+		if (closed_early || ui.midi_map_open)
+		{
+			std::fprintf(stderr, "FAIL: closing the mappings modal left it open.\n");
+			return 1;
+		}
+
+		(void)closed;
+
+		for (int i = 0; i < kSettleFrames; ++i)
+		{
+			draw(nullptr, false, &stages);
+		}
+	}
+
+	// Boards this editor cannot draw (SF-71). Both are legal in the model and
+	// unreachable through this UI, which means the only way to arrive at one
+	// is a hand-edited preset or one written before this milestone -- and the
+	// only thing worse than refusing to draw it would be drawing half of it.
+	{
+		struct UndrawableCase
+		{
+			BoardGraphNodes graph;
+			const char* what;
+			const char* mentions;
+		};
+
+		const UndrawableCase cases[] = {
+			{TwoSplitsGraph(), "two splits on the trunk", "more than one split"},
+			{NestedSplitGraph(), "a split inside a channel", "split inside a channel"},
+		};
+
+		for (const UndrawableCase& one : cases)
+		{
+			// The shape is decided by a pure function, so what the board will
+			// do is assertable without drawing anything -- and the reason is
+			// asserted too, since two different refusals that both said
+			// "cannot draw this" would send someone to the wrong file.
+			const BoardShape shape = ReadShape(one.graph);
+
+			if (shape.drawable)
+			{
+				std::fprintf(stderr, "FAIL: %s was read as drawable.\n", one.what);
+				return 1;
+			}
+
+			if (shape.problem.find(one.mentions) == std::string::npos)
+			{
+				std::fprintf(stderr, "FAIL: the refusal for %s says '%s', which does not mention '%s'.\n", one.what,
+					shape.problem.c_str(), one.mentions);
+				return 1;
+			}
+
+			board_graph = &one.graph;
+
+			BoardViewState refused;
+
+			for (int i = 0; i < kSettleFrames; ++i)
+			{
+				refused = draw(nullptr, false, &stages);
+			}
+
+			if (!Find(refused.widgets, "chain-undrawable"))
+			{
+				std::fprintf(stderr, "FAIL: %s drew no warning banner.\n", one.what);
+				return 1;
+			}
+
+			// Read-only means read-only: not one edit affordance, including
+			// the signal-path control, which is the one that would otherwise
+			// look like a way out and would be editing a shape it cannot see.
+			const char* const forbidden[] = {"add-stage:pre", "add-stage:post", "add-stage:a", "add-stage:b",
+				"channels:0", "channels:1", "mixer-toggle", "splitter-toggle", "mute:a", "mute:b"};
+
+			for (const char* id : forbidden)
+			{
+				if (Find(refused.widgets, id))
+				{
+					std::fprintf(stderr, "FAIL: %s still drew '%s' -- the chain area is not read-only.\n", one.what, id);
+					return 1;
+				}
+			}
+
+			if (CountWithPrefix(refused.widgets, "expand:") != 0)
+			{
+				std::fprintf(stderr, "FAIL: %s drew %zu stage card(s) beside its warning.\n", one.what,
+					CountWithPrefix(refused.widgets, "expand:"));
+				return 1;
+			}
+
+			// The sidebar is not the chain, and an undrawable board must not
+			// take the rest of the window down with it: the preset list is
+			// how someone gets *off* this board.
+			if (!Find(refused.widgets, "preset:0"))
+			{
+				std::fprintf(stderr, "FAIL: %s took the preset list with it.\n", one.what);
+				return 1;
+			}
+		}
+
+		board_graph = &linear;
 	}
 
 	// And with no chain at all: the layout a board started from a preset path
@@ -1061,6 +2875,41 @@ int RunUiSelfTest(int frames)
 			return 1;
 		}
 
+		// Both of the dialog's entry points, and the one thing that differs
+		// between them (SF-80). Menu-invoked, there is something to cancel
+		// back to and Cancel is offered; on a first run there is not, and a
+		// button that closed the only way of configuring audio would leave a
+		// board that cannot start.
+		if (!Find(audio.widgets, "audio:apply") || !Find(audio.widgets, "audio:cancel"))
+		{
+			std::fprintf(stderr, "FAIL: the audio modal drew no Apply or no Cancel.\n");
+			return 1;
+		}
+
+		{
+			audio.first_run = true;
+
+			draw_audio(nullptr, false);
+			draw_audio(nullptr, false);
+
+			if (!Find(audio.widgets, "audio:apply"))
+			{
+				std::fprintf(stderr, "FAIL: the first-run dialog drew no Start button.\n");
+				return 1;
+			}
+
+			if (Find(audio.widgets, "audio:cancel"))
+			{
+				std::fprintf(stderr, "FAIL: the first-run dialog offered a Cancel with nothing to cancel to.\n");
+				return 1;
+			}
+
+			audio.first_run = false;
+
+			draw_audio(nullptr, false);
+			draw_audio(nullptr, false);
+		}
+
 		// Open the input dropdown. Only then do its rows exist at all -- which
 		// is exactly why this has to be a real click and not just a redraw.
 		if (!closed_early && !click_audio("audio-input:combo"))
@@ -1129,6 +2978,53 @@ int RunUiSelfTest(int frames)
 			}
 		}
 
+		// How wide the board's input is (SF-76). This is the setting the
+		// splitter's stereo mode depends on, and it is the one place it can be
+		// chosen -- with one input channel there are no sides to divide.
+		if (!closed_early)
+		{
+			if (audio.board_inputs != 1)
+			{
+				std::fprintf(stderr, "FAIL: the dialog opened showing %u board input(s), expected 1.\n",
+					audio.board_inputs);
+				return 1;
+			}
+
+			draw_audio(nullptr, false);
+
+			if (!click_audio("audio-inputs:combo"))
+			{
+				return 1;
+			}
+
+			for (int i = 0; i < kSettleFrames && !closed_early; ++i)
+			{
+				draw_audio(nullptr, false);
+			}
+
+			if (!click_audio("audio-inputs:stereo"))
+			{
+				return 1;
+			}
+
+			if (audio.board_inputs != 2)
+			{
+				std::fprintf(stderr, "FAIL: choosing a stereo board input left it at %u.\n", audio.board_inputs);
+				return 1;
+			}
+
+			// The port filters are a different question from how many channels
+			// the board takes, and picking one must not disturb the other.
+			if (audio.input_filter != "Scarlett:capture_AUX0")
+			{
+				std::fprintf(stderr, "FAIL: choosing a stereo board input changed the port to '%s'.\n",
+					audio.input_filter.c_str());
+				return 1;
+			}
+
+			audio.board_inputs = 1;
+		}
+
 		// A saved port whose hardware isn't present must survive being drawn
 		// *and* being looked at -- the row is inside the open dropdown, so
 		// this only means anything with the combo open.
@@ -1179,6 +3075,57 @@ int RunUiSelfTest(int frames)
 	{
 		std::fprintf(stderr, "FAIL: window closed before the checks finished.\n");
 		return 1;
+	}
+
+	// The way out (SF-73). Quit is a key chord rather than a button precisely
+	// so the shutdown path has a deliberate trigger that isn't the window
+	// manager, and a trigger nothing pulls is a trigger nobody knows is
+	// broken. So the self-test ends by pulling it.
+	//
+	// What this asserts is the *request* -- the flag the main loop watches --
+	// not the shutdown itself: `--test-ui` drives the view directly and never
+	// builds an engine, so there is no loop here to leave. The half that is
+	// reachable from here is the half that keeps silently rotting; the other
+	// half is one `if` in main.cpp that every ordinary run executes.
+	{
+		// A chord is pressed on the frame the key goes down with the modifier
+		// already held, which is also the order a real keyboard sends them in.
+		ImGuiIO& keys = ImGui::GetIO();
+
+		keys.AddKeyEvent(ImGuiMod_Ctrl, true);
+		keys.AddKeyEvent(ImGuiKey_Q, true);
+
+		const BoardViewState quit = draw(nullptr, false, &stages);
+
+		keys.AddKeyEvent(ImGuiKey_Q, false);
+		keys.AddKeyEvent(ImGuiMod_Ctrl, false);
+
+		if (!quit.quit_requested)
+		{
+			std::fprintf(stderr, "FAIL: Ctrl-Q did not ask the board to quit.\n");
+			return 1;
+		}
+
+		// And nothing else went with it: a shortcut that also saved, switched
+		// preset or edited the chain on its way out would be worse than no
+		// shortcut at all.
+		if (quit.save_requested || quit.graph_edit != GraphEdit::None || quit.stage_edit != StageEdit::None)
+		{
+			std::fprintf(stderr, "FAIL: Ctrl-Q also asked for save=%d graph_edit=%d stage_edit=%d.\n",
+				static_cast<int>(quit.save_requested), static_cast<int>(quit.graph_edit),
+				static_cast<int>(quit.stage_edit));
+			return 1;
+		}
+
+		// A board drawn with no chord held must not ask to quit, or the check
+		// above would pass on a flag that was simply always set.
+		const BoardViewState staying = draw(nullptr, false, &stages);
+
+		if (staying.quit_requested)
+		{
+			std::fprintf(stderr, "FAIL: the board asked to quit with nothing pressed.\n");
+			return 1;
+		}
 	}
 
 	window.Close();

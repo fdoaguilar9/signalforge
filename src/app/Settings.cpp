@@ -17,6 +17,13 @@ namespace
 constexpr int kMinWindowSize = 240;
 constexpr int kMaxWindowSize = 16384;
 
+// The trims' range, from the design. Wide enough to rescue a very quiet
+// single-coil or tame a hot active pickup, narrow enough that a slider is
+// still usable -- and clamped rather than trusted, since a hand-edited +200
+// would be an instant full-scale blast through whatever is plugged in.
+constexpr double kMinGainDb = -24.0;
+constexpr double kMaxGainDb = 24.0;
+
 }  // namespace
 
 std::string Settings::DefaultPath()
@@ -43,6 +50,9 @@ void Settings::Clamp()
 
 	crossfade_ms = Crossfade::ClampMilliseconds(crossfade_ms);
 
+	input_gain_db = std::min(kMaxGainDb, std::max(kMinGainDb, input_gain_db));
+	output_gain_db = std::min(kMaxGainDb, std::max(kMinGainDb, output_gain_db));
+
 	audio.Clamp();
 }
 
@@ -52,6 +62,7 @@ nlohmann::json Settings::ToJson() const
 		{"window", {{"width", window_width}, {"height", window_height}}},
 		{"last_preset", last_preset},
 		{"crossfade", {{"milliseconds", crossfade_ms}, {"curve", ToString(crossfade_curve)}}},
+		{"gain", {{"input_db", input_gain_db}, {"output_db", output_gain_db}}},
 		{"audio", audio.ToJson()},
 	};
 }
@@ -102,6 +113,21 @@ Settings Settings::FromJson(const nlohmann::json& json)
 			// An unknown curve name keeps the default rather than refusing the
 			// file: a typo shouldn't cost you your window size as well.
 			ParseCrossfadeCurve(crossfade["curve"].get<std::string>(), out.crossfade_curve);
+		}
+	}
+
+	if (json.contains("gain") && json["gain"].is_object())
+	{
+		const nlohmann::json& gain = json["gain"];
+
+		if (gain.contains("input_db") && gain["input_db"].is_number())
+		{
+			out.input_gain_db = gain["input_db"].get<double>();
+		}
+
+		if (gain.contains("output_db") && gain["output_db"].is_number())
+		{
+			out.output_gain_db = gain["output_db"].get<double>();
 		}
 	}
 

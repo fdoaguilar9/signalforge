@@ -23,8 +23,12 @@ struct Settings
 	// The window's last size. Position is not kept on purpose: under Wayland a
 	// client cannot place its own window, so a remembered position is a value
 	// that silently does nothing on half the machines this runs on.
-	int window_width = 720;
-	int window_height = 560;
+	//
+	// Wide by default because the board is now a fixed 330px sidebar beside a
+	// chain (SF-62), and at the 720 this used to be, the chain gets less room
+	// than the meters do. A first run should show a board, not a column.
+	int window_width = 1280;
+	int window_height = 800;
 
 	// The filename stem of the preset that was playing, so a board comes back
 	// up where it left off. A stem rather than a path because presets get
@@ -37,6 +41,17 @@ struct Settings
 	// handover from two takes of the same amp.
 	double crossfade_ms = Crossfade::kDefaultMilliseconds;
 	CrossfadeCurve crossfade_curve = CrossfadeCurve::EqualPower;
+
+	// SF-66. The board-wide trims, in dB: one before the first stage, one
+	// after the last.
+	//
+	// **Settings rather than preset**, deliberately. These match the board to
+	// the interface it is plugged into -- the pickup's output, how hot the
+	// converter runs -- and none of that changes when you stomp to the next
+	// preset. A per-preset output level is a different feature and should not
+	// arrive by accident through this one.
+	double input_gain_db = 0.0;
+	double output_gain_db = 0.0;
 
 	// SF-34/36/40. Driver/device/rate/buffer, and whether the audio backend
 	// has actually been configured yet -- `audio.configured == false` is

@@ -287,6 +287,40 @@ bool ParseLearnCommand(const std::string& arguments, MidiBinding& out, std::stri
 
 			break;
 		}
+
+		// The board-wide targets (SF-68). None of them names a stage, because
+		// none of them is in the chain -- the trims sit outside it, and there
+		// is one splitter and one mixer.
+		case MidiAction::SetSplitterControl:
+		{
+			if (!(stream >> out.port) || (out.port != "send_a" && out.port != "send_b" && out.port != "crossover"))
+			{
+				error = "set_splitter needs one of: send_a, send_b, crossover";
+				return false;
+			}
+			break;
+		}
+
+		case MidiAction::SetMixerLevel:
+		{
+			if (!(stream >> out.port) || (out.port != "a" && out.port != "b"))
+			{
+				error = "set_mixer needs a channel: a or b";
+				return false;
+			}
+			break;
+		}
+
+		case MidiAction::SetInputGain:
+		case MidiAction::SetOutputGain:
+		case MidiAction::SetTempo:
+		case MidiAction::NextBank:
+		case MidiAction::PrevBank:
+		case MidiAction::ToggleMetronome:
+			// No target to name: each of these addresses exactly one thing.
+			// The continuous ones get their range from the control they were
+			// armed beside, the way SetControl does.
+			break;
 	}
 
 	return true;

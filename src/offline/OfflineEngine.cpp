@@ -13,7 +13,7 @@ OfflineEngine::OfflineEngine(uint32_t block_size)
 }
 
 OfflineEngine::Result OfflineEngine::Run(
-	AudioHost& host, uint64_t total_frames, const std::function<float(uint64_t)>& generator)
+	AudioHost& host, uint64_t total_frames, const std::function<float(uint64_t, uint32_t)>& generator)
 {
 	std::vector<uint32_t> input_indices;
 	std::vector<uint32_t> output_indices;
@@ -69,7 +69,7 @@ OfflineEngine::Result OfflineEngine::Run(
 		{
 			for (uint32_t i = 0; i < frames_this_block; ++i)
 			{
-				input_buffers[ch][i] = generator(frame + i);
+				input_buffers[ch][i] = generator(frame + i, static_cast<uint32_t>(ch));
 			}
 
 			host.ConnectAudioPort(input_indices[ch], input_buffers[ch].data());
@@ -120,7 +120,7 @@ OfflineEngine::Result OfflineEngine::Run(
 	return result;
 }
 
-std::function<float(uint64_t)> MakeSineSweep(
+std::function<float(uint64_t, uint32_t)> MakeSineSweep(
 	double sample_rate, double duration_seconds, double start_hz, double end_hz, float amplitude)
 {
 	// Exponential sweep: instantaneous frequency goes start_hz -> end_hz over
@@ -128,13 +128,17 @@ std::function<float(uint64_t)> MakeSineSweep(
 	// function of the frame index (no accumulator state to get out of sync).
 	const double ratio = std::log(end_hz / start_hz);
 
-	return [sample_rate, duration_seconds, start_hz, ratio, amplitude](uint64_t frame) -> float
+	return [sample_rate, duration_seconds, start_hz, ratio, amplitude](uint64_t frame, uint32_t channel) -> float
 	{
 		const double t = static_cast<double>(frame) / sample_rate;
 		const double phase =
 			2.0 * M_PI * start_hz * duration_seconds / ratio * (std::exp(t / duration_seconds * ratio) - 1.0);
 
-		return amplitude * static_cast<float>(std::sin(phase));
+		// Channel 0 exactly as before; anything to its right 12 dB down, so
+		// the two sides of a stereo input can be told apart (SF-76).
+		const float level = channel == 0 ? amplitude : amplitude * 0.25f;
+
+		return level * static_cast<float>(std::sin(phase));
 	};
 }
 

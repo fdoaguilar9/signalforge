@@ -84,6 +84,16 @@ struct AudioConfig
 	std::string input_ports;
 	std::string output_ports;
 
+	// SF-52: how many inputs the board itself takes. 0 means "auto" -- as many
+	// as the first pedal in the chain wants, which is what this did before it
+	// was a choice, and is right for a guitar into a mono amp sim.
+	//
+	// Worth being able to say explicitly rather than always inferring: a
+	// stereo board fed from a mono head plugin should still be able to take
+	// two inputs, and the alternative is that the whole board's width is
+	// decided by whichever pedal happens to be first.
+	unsigned board_inputs = 0;
+
 	// Whether this config has actually been chosen (by a user, or by
 	// discovering an already-running server) rather than being untouched
 	// defaults. Drives SF-36's first-run gate: a config that has never been

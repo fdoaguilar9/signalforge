@@ -104,4 +104,78 @@ if(NOT overridden MATCHES "Crossfade: 3.0 ms, equal-power")
 	message(FATAL_ERROR "--crossfade-ms/--crossfade-curve did not override the settings file:\n${overridden}")
 endif()
 
-message(STATUS "Resume, fallback and crossfade configuration all behave.")
+# --- banks (SF-67) ---
+#
+# A bank is a subdirectory of the preset directory. Everything above ran
+# without one and has to keep working exactly as it did, which is why the bank
+# cases come last rather than being folded into the fixtures above.
+
+set(bank_dir "${preset_dir}/Worship set")
+file(MAKE_DIRECTORY "${bank_dir}")
+
+file(WRITE "${bank_dir}/w1-ambient.json"
+"{\n  \"name\": \"Ambient\",\n  \"chain\": [ { \"uri\": \"urn:signalforge:test-c\", \"controls\": {} } ]\n}\n")
+
+file(WRITE "${bank_dir}/w2-swell.json"
+"{\n  \"name\": \"Swell\",\n  \"chain\": [ { \"uri\": \"urn:signalforge:test-d\", \"controls\": {} } ]\n}\n")
+
+# 7. The Default bank still comes first, so a library that has grown a bank
+#    still starts where it always did when nothing is remembered.
+file(WRITE ${settings} "{\n  \"window\": { \"width\": 800, \"height\": 600 }\n}\n")
+run_board(with_bank)
+
+if(NOT with_bank MATCHES "Loading preset 'First'")
+	message(FATAL_ERROR "Adding a bank changed where the board starts:\n${with_bank}")
+endif()
+
+# 8. A preset inside a bank, named the way settings now writes it.
+file(WRITE ${settings} "{\n  \"last_preset\": \"Worship set/w2-swell\"\n}\n")
+run_board(in_bank)
+
+if(NOT in_bank MATCHES "Resuming 'Worship set/w2-swell'")
+	message(FATAL_ERROR "The board did not resume a preset inside a bank:\n${in_bank}")
+endif()
+
+if(NOT in_bank MATCHES "Loading preset 'Swell'")
+	message(FATAL_ERROR "Resuming into a bank loaded the wrong preset:\n${in_bank}")
+endif()
+
+# 9. An unqualified name still finds a preset in another bank, so a stem that
+#    is unique does not have to be spelled out.
+file(WRITE ${settings} "{\n  \"last_preset\": \"w1-ambient\"\n}\n")
+run_board(unqualified)
+
+if(NOT unqualified MATCHES "Loading preset 'Ambient'")
+	message(FATAL_ERROR "An unqualified stem did not resolve into a bank:\n${unqualified}")
+endif()
+
+# 10. Naming a bank that exists and a preset that doesn't is refused rather
+#     than falling back to a same-named preset somewhere else -- an explicitly
+#     named bank means that bank, or nothing.
+file(WRITE ${settings} "{\n  \"last_preset\": \"Worship set/01-first\"\n}\n")
+run_board(wrong_bank)
+
+if(NOT wrong_bank MATCHES "is gone; starting at the first one")
+	message(FATAL_ERROR "A preset named in the wrong bank was found anyway:\n${wrong_bank}")
+endif()
+
+if(NOT wrong_bank MATCHES "Loading preset 'First'")
+	message(FATAL_ERROR "After refusing a wrong-bank name, the board did not fall back:\n${wrong_bank}")
+endif()
+
+# 11. **The bank itself has been deleted since.** The stale-preset case above
+#     covers a missing file; this covers a missing folder, which is what
+#     happens when someone tidies up their presets between gigs.
+file(REMOVE_RECURSE "${bank_dir}")
+file(WRITE ${settings} "{\n  \"last_preset\": \"Worship set/w2-swell\"\n}\n")
+run_board(bank_gone)
+
+if(NOT bank_gone MATCHES "is gone; starting at the first one")
+	message(FATAL_ERROR "A remembered preset whose whole bank was deleted did not fall back:\n${bank_gone}")
+endif()
+
+if(NOT bank_gone MATCHES "Loading preset 'First'")
+	message(FATAL_ERROR "After a deleted bank, the board did not start at the first preset:\n${bank_gone}")
+endif()
+
+message(STATUS "Resume, fallback, banks and crossfade configuration all behave.")

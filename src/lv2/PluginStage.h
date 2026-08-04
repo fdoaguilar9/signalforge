@@ -48,6 +48,17 @@ public:
 	// Falls back to the URI when the plugin declares no usable name.
 	std::string Name() const;
 
+	// Whether the plugin ships an editor of its own (SF-79). Asked of lilv
+	// rather than assumed, because it decides whether a button appears -- and
+	// an "Open plugin UI" that opened nothing would be worse than no button.
+	//
+	// **This host does not embed one.** Hosting a plugin's own editor through
+	// suil is a v1 non-goal (PLAN.md §2); what this gates is a modal that says
+	// so and offers the generic controls instead. Knowing the editor exists is
+	// still worth showing: it tells a player why the knobs here look different
+	// from the ones in the screenshots.
+	bool HasCustomUi() const;
+
 	// Sets a control port's value by symbol (e.g. "gain"), clamped to the
 	// port's declared [min, max] range. Returns false (with a diagnostic on
 	// stderr) if no control port with that symbol exists.
@@ -56,6 +67,16 @@ public:
 	// Returns the control port's current value, or NaN if no control port
 	// with that symbol exists.
 	float GetControl(const std::string& symbol) const;
+
+	// How many samples of delay this plugin says it adds, from its
+	// lv2:latency-designated output port. Zero when it declares none.
+	//
+	// Read at build time, after activation. A plugin that changes its latency
+	// while running (a lookahead limiter switching modes, say) is not
+	// followed: the alignment delay across a split is fixed when the chain is
+	// compiled, and re-planning mid-block is not something the audio thread
+	// can do. Rebuilding the chain picks up the new figure.
+	uint32_t LatencySamples() const;
 
 	// Repoints an audio port's buffer for the upcoming Run() call. `index`
 	// is the port's index as reported in Ports().

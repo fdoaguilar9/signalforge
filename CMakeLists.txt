@@ -68,6 +68,57 @@ add_executable(midi_learn_test tests/MidiLearnTest.cpp src/midi/MidiLearn.cpp sr
 target_include_directories(midi_learn_test PRIVATE src/third_party)
 add_test(NAME midi_learn COMMAND midi_learn_test)
 
+# The board-wide trims: that a gain is the gain it says it is, and that
+# changing one leaves no discontinuity -- including across the block boundary,
+# which is the seam a per-block gain would click at. Pure arithmetic, so the
+# claim is asserted rather than listened for.
+add_executable(gain_test tests/GainTest.cpp)
+target_include_directories(gain_test PRIVATE src)
+add_test(NAME gain COMMAND gain_test)
+
+# The meter's arithmetic: which segment is which colour, what silence and a
+# clipped signal do to the scale, and how fast the peak marker falls. Pure, so
+# it needs neither a window nor SDL2 -- and it is the half of the meter that
+# looking at the screen would never settle.
+# SF-85: the gate's arithmetic. Pure -- no JACK, no plugins -- which is the
+# whole point: a gate is meant to be inaudible when it is right, so every claim
+# its sliders make is checked here rather than listened for.
+# SF-86: collapsing to one channel and going back. Pure graph surgery -- no
+# plugins, no audio, no files -- so the round trip a player actually cares
+# about is asserted rather than clicked through.
+add_executable(split_edit_test tests/SplitEditTest.cpp src/preset/SplitEdit.cpp src/preset/Preset.cpp
+	src/preset/ChainGraph.cpp)
+target_include_directories(split_edit_test PRIVATE src/third_party)
+add_test(NAME split_edit COMMAND split_edit_test)
+
+add_executable(noise_gate_test tests/NoiseGateTest.cpp src/audio/NoiseGate.cpp)
+add_test(NAME noise_gate COMMAND noise_gate_test)
+
+add_executable(metronome_test tests/MetronomeTest.cpp src/audio/Metronome.cpp)
+add_test(NAME metronome COMMAND metronome_test)
+
+add_executable(pitch_detect_test tests/PitchDetectTest.cpp src/audio/PitchDetect.cpp)
+target_compile_definitions(pitch_detect_test PRIVATE _USE_MATH_DEFINES)
+add_test(NAME pitch_detect COMMAND pitch_detect_test)
+
+add_executable(meter_test tests/MeterTest.cpp)
+target_include_directories(meter_test PRIVATE src)
+add_test(NAME meter COMMAND meter_test)
+
+# Compiling a chain's shape into block operations: adapters, split/merge,
+# lane alignment, and what the operations do to samples. The planner takes
+# channel counts as numbers rather than asking plugins, so what a split means
+# is assertable with nothing installed.
+add_executable(chain_schedule_test tests/ChainScheduleTest.cpp src/lv2/ChainSchedule.cpp)
+add_test(NAME chain_schedule COMMAND chain_schedule_test)
+
+# The chain graph: node identity, signal order through a split, structural
+# edits, and both JSON forms a preset can be written in. Pure data, so no
+# plugins or audio server are needed to say what a board means.
+add_executable(chain_graph_test tests/ChainGraphTest.cpp src/preset/ChainGraph.cpp src/preset/Preset.cpp)
+target_include_directories(chain_graph_test PRIVATE src/third_party)
+add_test(NAME chain_graph COMMAND chain_graph_test)
+
 # The crossfade ramp: shape, length, and what happens across block boundaries.
 # Pure arithmetic, so the sound of a switch is measurable without an audio
 # server -- only the choice between the two curves needs ears.
@@ -210,6 +261,18 @@ add_test(NAME missing_plugin
 set_tests_properties(missing_plugin PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED")
 
 # Bypass removes a stage from the signal path exactly, not approximately.
+# SF-49: a split preset, end to end -- loaded from the nested "graph" form,
+# planned, instantiated against real plugins, and run. The arithmetic is
+# checked in chain_schedule_test; this checks the whole path.
+add_test(NAME split_routing
+	COMMAND ${CMAKE_COMMAND}
+		-DSIGNALFORGE=$<TARGET_FILE:signalforge>
+		-DPLUGIN_URI=http://kxstudio.sf.net/carla/plugins/audiogain
+		-DCMAKE_CURRENT_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunSplitTest.cmake
+)
+set_tests_properties(split_routing PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED")
+
 add_test(NAME bypass
 	COMMAND ${CMAKE_COMMAND}
 		-DSIGNALFORGE=$<TARGET_FILE:signalforge>

@@ -1,0 +1,7 @@
+:root{
+--shadow-panel:0 1px 0 rgba(255,255,255,0.03) inset, 0 4px 12px rgba(0,0,0,0.35);
+--shadow-raised:0 1px 0 rgba(255,255,255,0.04) inset, 0 2px 4px rgba(0,0,0,0.3);
+--shadow-inset:inset 0 1px 3px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(0,0,0,0.3);
+--shadow-modal:0 12px 40px rgba(0,0,0,0.55);
+--shadow-focus:0 0 0 2px var(--bg-surface), 0 0 0 4px var(--focus-ring);
+}

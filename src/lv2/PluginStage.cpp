@@ -1,5 +1,6 @@
 #include "PluginStage.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -278,6 +279,31 @@ float PluginStage::GetControl(const std::string& symbol) const
 	return std::numeric_limits<float>::quiet_NaN();
 }
 
+uint32_t PluginStage::LatencySamples() const
+{
+	for (const PortInfo& port : ports_)
+	{
+		if (port.type != PortType::Control || port.direction != PortDirection::Output || !port.reports_latency)
+		{
+			continue;
+		}
+
+		const float samples = control_storage_[port.index];
+
+		// A latency port is a float that holds a whole number of samples. A
+		// negative or non-finite one is a plugin bug, and taking it at face
+		// value would size a delay line from garbage.
+		if (!(samples > 0.0f) || !std::isfinite(samples))
+		{
+			return 0;
+		}
+
+		return static_cast<uint32_t>(samples);
+	}
+
+	return 0;
+}
+
 void PluginStage::PrepareAtomPorts()
 {
 	for (const PortInfo& port : ports_)
@@ -354,6 +380,26 @@ std::string PluginStage::Name() const
 	// A plugin is free to declare an empty name; the URI at least identifies
 	// it, which a blank row in the chain list would not.
 	return result.empty() ? Uri() : result;
+}
+
+bool PluginStage::HasCustomUi() const
+{
+	// On demand, like Name(), and for the same reason: this answers a question
+	// a person asked by looking at a card, never one the audio thread asked.
+	LilvUIs* uis = lilv_plugin_get_uis(plugin_);
+
+	if (!uis)
+	{
+		return false;
+	}
+
+	const bool any = lilv_uis_size(uis) > 0;
+	lilv_uis_free(uis);
+
+	// Deliberately not "a UI this host could show": there is no UI this host
+	// can show. The question is whether the plugin has one at all, which is
+	// what decides whether saying "we don't render it" is worth saying.
+	return any;
 }
 
 std::vector<PathProperty> PluginStage::PathProperties() const

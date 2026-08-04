@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="_ds/signalforge-design-system-cc3c6bcb-dd11-48f7-9aa7-90c10586e198/tokens/fonts.css">
+<link rel="stylesheet" href="_ds/signalforge-design-system-cc3c6bcb-dd11-48f7-9aa7-90c10586e198/styles.css">
+<script src="_ds/signalforge-design-system-cc3c6bcb-dd11-48f7-9aa7-90c10586e198/_ds_bundle.js"></script>
+<style>
+body{margin:0;background:var(--bg-app,#16171a);}
+a{color:var(--link,#8ea9c0);text-decoration:none;} a:hover{color:var(--link-hover,#6f8ba3);}
+input[type="text"]::placeholder{color:var(--gray-500);}
+</style>
+</helmet>
+<div data-screen-label="Signalforge" style="position:relative;height:100vh;display:flex;flex-direction:column;background:var(--bg-app);color:var(--text-primary);font-family:var(--font-ui);overflow:hidden">
+
+  <div style="display:flex;align-items:center;gap:16px;padding:0 16px;height:52px;flex:none;background:var(--bg-surface);border-bottom:1px solid var(--border-hairline)">
+    <span style="font-size:var(--text-md);font-weight:600;letter-spacing:var(--tracking-wide)">Signalforge</span>
+    <div style="width:1px;height:20px;background:var(--border-hairline)"></div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="font-size:var(--text-sm);color:var(--text-secondary)">{{ bankName }}</span>
+      <span style="font-size:var(--text-sm);color:var(--text-disabled)">&#8250;</span>
+      <span style="font-size:var(--text-sm)" title="{{ presetPath }}">{{ presetName }}</span>
+    </div>
+    <div style="flex:1"></div>
+    <div style="display:flex">
+      <button style="{{ boardTabStyle }}" onClick="{{ showBoard }}">Board</button>
+      <button style="{{ liveTabStyle }}" onClick="{{ showLive }}">Live</button>
+    </div>
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ openMidi }}" hint-size="auto,28px">MIDI map</x-import>
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ openTuner }}" hint-size="auto,28px">Tuner</x-import>
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ openMetro }}" hint-size="auto,28px">Metronome</x-import>
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ openSettings }}" hint-size="auto,28px">Audio settings</x-import>
+  </div>
+
+  <sc-if value="{{ learning }}" hint-placeholder-val="{{ false }}">
+    <div style="flex:none;display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--bg-surface);border-bottom:1px solid var(--border-hairline)">
+      <span style="color:var(--status-warning);font-size:var(--text-sm)">Press a switch or move a pedal to bind {{ learningWhat }}.</span>
+      <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ cancelLearn }}" hint-size="auto,26px">cancel</x-import>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ missingPluginDemo }}" hint-placeholder-val="{{ false }}">
+    <div style="flex:none;padding:8px 16px 0 16px">
+      <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.StatusBanner" tone="warning" hint-size="100%,36px">This preset references http://guitarix.sourceforge.net/plugins/gx_flanger which is not installed -- the stage was skipped.</x-import>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ isBoard }}" hint-placeholder-val="{{ true }}">
+    <div style="flex:1;display:flex;min-height:0">
+
+      <div style="width:330px;flex:none;display:flex;flex-direction:column;gap:20px;padding:16px;overflow-y:auto;border-right:1px solid var(--border-hairline)">
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-disabled)">BANK</span>
+            <div style="flex:1"></div>
+            <span style="font-size:var(--text-xs);color:var(--text-disabled)">next bank</span>
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ bankBound }}" binding-text="{{ bankBinding }}" armed="{{ armed }}" on-click="{{ onLearnBank }}" hint-size="auto,26px"></x-import>
+          </div>
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Select" placeholder="" value="{{ bankName }}" options="{{ bankNames }}" on-change="{{ onBankChange }}" hint-size="100%,34px"></x-import>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div style="display:flex;align-items:baseline;gap:8px">
+            <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-disabled)">PRESETS</span>
+            <span style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-disabled)">{{ presetCount }}</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span style="font-size:var(--text-xs);color:var(--text-disabled)">Step:</span>
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ nextBound }}" binding-text="{{ nextBinding }}" armed="{{ armed }}" on-click="{{ onLearnNext }}" hint-size="auto,26px"></x-import>
+            <span style="font-size:var(--text-xs);color:var(--text-disabled)">next</span>
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ prevBound }}" binding-text="{{ prevBinding }}" armed="{{ armed }}" on-click="{{ onLearnPrev }}" hint-size="auto,26px"></x-import>
+            <span style="font-size:var(--text-xs);color:var(--text-disabled)">prev</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:4px;border:1px solid var(--border-hairline);border-radius:var(--radius-md);padding:6px;background:var(--bg-inset)">
+            <sc-for list="{{ presetRows }}" as="pr" hint-placeholder-count="3">
+              <div style="display:flex;align-items:center;gap:6px">
+                <div style="flex:1;min-width:0">
+                  <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.ListRow" label="{{ pr.label }}" sublabel="{{ pr.sublabel }}" selected="{{ pr.selected }}" on-click="{{ pr.onClick }}" hint-size="100%,40px"></x-import>
+                </div>
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ pr.bound }}" binding-text="{{ pr.binding }}" armed="{{ armed }}" on-click="{{ pr.onLearn }}" hint-size="auto,26px"></x-import>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-disabled)">ENGINE</span>
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Table" rows="{{ engineRows }}" hint-size="100%,140px"></x-import>
+          <div style="display:flex;align-items:center;gap:8px" title="Share of each audio block's time budget spent running the chain">
+            <span style="width:44px;flex:none;font-size:var(--text-xs);color:var(--text-secondary)">DSP</span>
+            <div style="flex:1;display:flex;gap:2px;height:14px;padding:2px;background:var(--bg-inset);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);box-shadow:var(--shadow-inset)">
+              <sc-for list="{{ dspSegs }}" as="sg" hint-placeholder-count="28">
+                <div style="flex:1;border-radius:1px;background:{{ sg.bg }}"></div>
+              </sc-for>
+            </div>
+            <span style="width:60px;flex:none;text-align:right;font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-primary)">{{ dspText }}</span>
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-disabled)">LEVELS</span>
+          <sc-for list="{{ meters }}" as="m" hint-placeholder-count="2">
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="width:44px;flex:none;font-size:var(--text-xs);color:var(--text-secondary)">{{ m.label }}</span>
+              <div style="flex:1;position:relative;display:flex;gap:2px;height:14px;padding:2px;background:var(--bg-inset);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);box-shadow:var(--shadow-inset)">
+                <sc-for list="{{ m.segs }}" as="sg" hint-placeholder-count="28">
+                  <div style="flex:1;border-radius:1px;background:{{ sg.bg }}"></div>
+                </sc-for>
+                <div style="position:absolute;top:2px;bottom:2px;width:2px;background:var(--gray-200);left:{{ m.peakLeft }}"></div>
+              </div>
+              <span style="width:60px;flex:none;text-align:right;font-family:var(--font-mono);font-size:var(--text-xs);color:{{ m.dbColor }}">{{ m.dbText }}</span>
+            </div>
+          </sc-for>
+          <div style="display:flex;justify-content:space-between;margin:-4px 68px 0 52px;font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-disabled)">
+            <span>-60</span><span>-30</span><span>-18</span><span>-12</span><span>-6</span><span>0</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="flex:1;min-width:0">
+              <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="Input gain" value="{{ inGain.value }}" min="{{ inGain.min }}" max="{{ inGain.max }}" unit=" dB" on-change="{{ inGain.onChange }}" hint-size="100%,44px"></x-import>
+            </div>
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ inGain.bound }}" binding-text="{{ inGain.binding }}" armed="{{ armed }}" on-click="{{ inGain.onLearn }}" hint-size="auto,26px"></x-import>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="flex:1;min-width:0">
+              <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="Output gain" value="{{ outGain.value }}" min="{{ outGain.min }}" max="{{ outGain.max }}" unit=" dB" on-change="{{ outGain.onChange }}" hint-size="100%,44px"></x-import>
+            </div>
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ outGain.bound }}" binding-text="{{ outGain.binding }}" armed="{{ armed }}" on-click="{{ outGain.onLearn }}" hint-size="auto,26px"></x-import>
+          </div>
+          <sc-if value="{{ clipping }}" hint-placeholder-val="{{ false }}">
+            <span style="font-size:var(--text-xs);color:var(--meter-clip)">Output is clipping -- lower the level in the chain or at the interface.</span>
+          </sc-if>
+        </div>
+      </div>
+
+      <div style="flex:1;min-width:0;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:14px">
+        <div style="display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--bg-surface);border:1px solid var(--border-hairline);border-radius:var(--radius-md)">
+          <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-secondary)">SIGNAL PATH</span>
+          <div style="display:flex;flex:none">
+            <button style="{{ oneChStyle }}" onClick="{{ onUnsplit }}" title="Run every stage in one series chain">1 channel</button>
+            <button style="{{ twoChStyle }}" onClick="{{ onSplit }}" title="Split into two parallel channels with their own amps">2 channels</button>
+          </div>
+          <span style="flex:1;min-width:0;font-size:var(--text-2xs);color:var(--text-disabled)">{{ channelNote }}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px">
+          <div style="flex:1;height:1px;background:var(--border-hairline)"></div>
+          <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-disabled)">INPUT</span>
+          <div style="flex:1;height:1px;background:var(--border-hairline)"></div>
+        </div>
+
+        <sc-for list="{{ stagesPre }}" as="s" hint-placeholder-count="2">
+          <dc-import name="Stage" stage="{{ s }}" hint-size="100%,52px"></dc-import>
+        </sc-for>
+        <div style="display:flex;gap:8px">
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ onAddPre }}" hint-size="auto,28px">Add stage</x-import>
+        </div>
+
+        <sc-if value="{{ isSplit }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex;align-items:center;gap:12px">
+            <div style="flex:1;height:1px;background:var(--border-hairline)"></div>
+            <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--status-warning)">SPLIT</span>
+            <div style="flex:1;height:1px;background:var(--border-hairline)"></div>
+          </div>
+          <div style="width:min(560px,100%);margin:0 auto;display:flex;flex-direction:column;gap:12px;padding:12px 16px;background:var(--bg-surface);border:1px solid var(--border-hairline);border-radius:var(--radius-md);box-shadow:var(--shadow-panel)">
+            <div onClick="{{ toggleSplitter }}" style="display:flex;align-items:baseline;gap:8px;cursor:pointer" title="Show or hide the splitter's controls">
+              <span style="color:var(--text-secondary);font-size:var(--text-xs)">{{ splitterArrow }}</span>
+              <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-secondary)">SPLITTER</span>
+              <span style="font-size:var(--text-2xs);color:var(--text-disabled)">{{ splitterSummary }}</span>
+            </div>
+            <sc-if value="{{ splitterOpen }}" hint-placeholder-val="{{ true }}">
+
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Select" placeholder="" label="Mode" value="{{ splitMode }}" options="{{ splitModeOptions }}" on-change="{{ onSplitMode }}" hint-size="100%,52px"></x-import>
+            <sc-if value="{{ splitFull }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex;align-items:center;gap:12px">
+                <div style="flex:1;min-width:0">
+                  <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="Send A" value="{{ sendA.value }}" min="{{ sendA.min }}" max="{{ sendA.max }}" unit=" dB" on-change="{{ sendA.onChange }}" hint-size="260px,44px"></x-import>
+                </div>
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ sendA.bound }}" binding-text="{{ sendA.binding }}" armed="{{ armed }}" on-click="{{ sendA.onLearn }}" hint-size="auto,26px"></x-import>
+              </div>
+              <div style="display:flex;align-items:center;gap:12px">
+                <div style="flex:1;min-width:0">
+                  <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="Send B" value="{{ sendB.value }}" min="{{ sendB.min }}" max="{{ sendB.max }}" unit=" dB" on-change="{{ sendB.onChange }}" hint-size="260px,44px"></x-import>
+                </div>
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ sendB.bound }}" binding-text="{{ sendB.binding }}" armed="{{ armed }}" on-click="{{ sendB.onLearn }}" hint-size="auto,26px"></x-import>
+              </div>
+              <span style="font-size:var(--text-2xs);color:var(--text-disabled)">Level of the signal sent into each channel.</span>
+            </sc-if>
+            <sc-if value="{{ splitStereo }}" hint-placeholder-val="{{ false }}">
+              <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Select" placeholder="" label="Channel A source" value="{{ srcA }}" options="{{ srcOptions }}" on-change="{{ onSrcA }}" hint-size="100%,52px"></x-import>
+              <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Select" placeholder="" label="Channel B source" value="{{ srcB }}" options="{{ srcOptions }}" on-change="{{ onSrcB }}" hint-size="100%,52px"></x-import>
+              <span style="font-size:var(--text-2xs);color:var(--text-disabled)">{{ stereoNote }}</span>
+            </sc-if>
+            <sc-if value="{{ splitByFreq }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex;align-items:center;gap:12px">
+                <div style="flex:1;min-width:0">
+                  <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="Crossover" value="{{ splitFreq.value }}" min="{{ splitFreq.min }}" max="{{ splitFreq.max }}" unit=" Hz" logarithmic="{{ true }}" on-change="{{ splitFreq.onChange }}" hint-size="260px,44px"></x-import>
+                </div>
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ splitFreq.bound }}" binding-text="{{ splitFreq.binding }}" armed="{{ armed }}" on-click="{{ splitFreq.onLearn }}" hint-size="auto,26px"></x-import>
+              </div>
+              <span style="font-size:var(--text-2xs);color:var(--text-disabled)">Below the crossover feeds channel A, above it feeds channel B.</span>
+            </sc-if>
+            </sc-if>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start">
+            <div style="display:flex;flex-direction:column;gap:12px;padding:12px;border:1px solid var(--border-hairline);border-radius:var(--radius-md);background:var(--bg-inset)">
+              <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-secondary)">CHANNEL A</span>
+              <sc-for list="{{ stagesA }}" as="s" hint-placeholder-count="2">
+                <dc-import name="Stage" stage="{{ s }}" hint-size="100%,52px"></dc-import>
+              </sc-for>
+              <div>
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ onAddA }}" hint-size="auto,28px">Add stage</x-import>
+              </div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:12px;padding:12px;border:1px solid var(--border-hairline);border-radius:var(--radius-md);background:var(--bg-inset)">
+              <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-secondary)">CHANNEL B</span>
+              <sc-for list="{{ stagesB }}" as="s" hint-placeholder-count="2">
+                <dc-import name="Stage" stage="{{ s }}" hint-size="100%,52px"></dc-import>
+              </sc-for>
+              <div>
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ onAddB }}" hint-size="auto,28px">Add stage</x-import>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px">
+            <div style="flex:1;height:1px;background:var(--border-hairline)"></div>
+            <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--status-warning)">MERGE</span>
+            <div style="flex:1;height:1px;background:var(--border-hairline)"></div>
+          </div>
+          <div style="width:min(560px,100%);margin:0 auto;display:flex;flex-direction:column;gap:12px;padding:12px 16px;background:var(--bg-surface);border:1px solid var(--border-hairline);border-radius:var(--radius-md);box-shadow:var(--shadow-panel)">
+            <div onClick="{{ toggleMixer }}" style="display:flex;align-items:baseline;gap:8px;cursor:pointer" title="Show or hide the mixer's controls">
+              <span style="color:var(--text-secondary);font-size:var(--text-xs)">{{ mixerArrow }}</span>
+              <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-secondary)">MIXER</span>
+              <span style="font-size:var(--text-2xs);color:var(--text-disabled)">{{ mixerSummary }}</span>
+            </div>
+            <sc-if value="{{ mixerOpen }}" hint-placeholder-val="{{ true }}">
+            <div style="display:flex;align-items:center;gap:12px">
+              <div style="flex:1;min-width:0">
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="Level A" value="{{ mixA.value }}" min="{{ mixA.min }}" max="{{ mixA.max }}" unit=" dB" on-change="{{ mixA.onChange }}" hint-size="260px,44px"></x-import>
+              </div>
+              <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ mixA.bound }}" binding-text="{{ mixA.binding }}" armed="{{ armed }}" on-click="{{ mixA.onLearn }}" hint-size="auto,26px"></x-import>
+            </div>
+            <div style="display:flex;align-items:center;gap:12px">
+              <div style="flex:1;min-width:0">
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="Level B" value="{{ mixB.value }}" min="{{ mixB.min }}" max="{{ mixB.max }}" unit=" dB" on-change="{{ mixB.onChange }}" hint-size="260px,44px"></x-import>
+              </div>
+              <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ mixB.bound }}" binding-text="{{ mixB.binding }}" armed="{{ armed }}" on-click="{{ mixB.onLearn }}" hint-size="auto,26px"></x-import>
+            </div>
+            </sc-if>
+          </div>
+          <sc-for list="{{ stagesPost }}" as="s" hint-placeholder-count="1">
+            <dc-import name="Stage" stage="{{ s }}" hint-size="100%,52px"></dc-import>
+          </sc-for>
+          <div>
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ onAddPost }}" hint-size="auto,28px">Add stage</x-import>
+          </div>
+        </sc-if>
+
+        <div style="display:flex;align-items:center;gap:12px">
+          <div style="flex:1;height:1px;background:var(--border-hairline)"></div>
+          <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-disabled)">OUTPUT</span>
+          <div style="flex:1;height:1px;background:var(--border-hairline)"></div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ isLive }}" hint-placeholder-val="{{ false }}">
+    <div data-screen-label="Live" style="flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;align-items:center;gap:28px;padding:48px 32px">
+      <span style="font-family:var(--font-mono);font-size:var(--text-sm);letter-spacing:var(--tracking-wider);color:var(--text-secondary)">{{ bankNameUpper }}</span>
+      <span style="font-size:84px;font-weight:600;line-height:1;letter-spacing:-0.01em;text-align:center">{{ presetName }}</span>
+      <span style="font-family:var(--font-mono);font-size:var(--text-sm);color:var(--text-disabled)">Next: {{ nextPresetName }}</span>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;width:min(880px,100%)">
+        <sc-for list="{{ liveTiles }}" as="t" hint-placeholder-count="3">
+          <sc-if value="{{ t.active }}" hint-placeholder-val="{{ false }}">
+            <div onClick="{{ t.onClick }}" style="height:104px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;cursor:pointer;background:var(--bg-surface-raised);border:2px solid var(--accent-primary);border-radius:var(--radius-md);box-shadow:var(--shadow-panel)">
+              <span style="font-size:var(--text-lg);color:var(--accent-primary)">{{ t.name }}</span>
+              <span style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-secondary)">{{ t.binding }}</span>
+            </div>
+          </sc-if>
+          <sc-if value="{{ t.inactive }}" hint-placeholder-val="{{ true }}">
+            <div onClick="{{ t.onClick }}" style="height:104px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;cursor:pointer;background:var(--bg-surface);border:1px solid var(--border-hairline);border-radius:var(--radius-md)">
+              <span style="font-size:var(--text-lg);color:var(--text-secondary)">{{ t.name }}</span>
+              <span style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-disabled)">{{ t.binding }}</span>
+            </div>
+          </sc-if>
+        </sc-for>
+      </div>
+      <div style="display:flex;gap:16px;width:min(880px,100%)">
+        <button onClick="{{ onPrevPreset }}" style="flex:1;height:64px;background:var(--bg-surface);color:var(--text-primary);border:1px solid var(--border-strong);border-radius:var(--radius-md);font-family:var(--font-ui);font-size:var(--text-lg);cursor:pointer">Prev</button>
+        <button onClick="{{ onNextPreset }}" style="flex:1;height:64px;background:var(--bg-surface);color:var(--text-primary);border:1px solid var(--border-strong);border-radius:var(--radius-md);font-family:var(--font-ui);font-size:var(--text-lg);cursor:pointer">Next</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px;width:min(640px,100%)">
+        <sc-for list="{{ meters }}" as="m" hint-placeholder-count="2">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="width:52px;flex:none;font-size:var(--text-sm);color:var(--text-secondary)">{{ m.label }}</span>
+            <div style="flex:1;position:relative;display:flex;gap:2px;height:20px;padding:3px;background:var(--bg-inset);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);box-shadow:var(--shadow-inset)">
+              <sc-for list="{{ m.segs }}" as="sg" hint-placeholder-count="28">
+                <div style="flex:1;border-radius:1px;background:{{ sg.bg }}"></div>
+              </sc-for>
+              <div style="position:absolute;top:3px;bottom:3px;width:2px;background:var(--gray-200);left:{{ m.peakLeft }}"></div>
+            </div>
+            <span style="width:72px;flex:none;text-align:right;font-family:var(--font-mono);font-size:var(--text-sm);color:{{ m.dbColor }}">{{ m.dbText }}</span>
+          </div>
+        </sc-for>
+        <div style="display:flex;justify-content:space-between;margin:-4px 82px 0 62px;font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-disabled)">
+          <span>-60</span><span>-30</span><span>-18</span><span>-12</span><span>-6</span><span>0</span>
+        </div>
+        <sc-if value="{{ clipping }}" hint-placeholder-val="{{ false }}">
+          <span style="font-size:var(--text-sm);color:var(--meter-clip);text-align:center">Output is clipping -- lower the level in the chain or at the interface.</span>
+        </sc-if>
+      </div>
+    </div>
+  </sc-if>
+
+  <div style="flex:none;display:flex;align-items:center;gap:12px;padding:8px 16px;background:var(--bg-surface);border-top:1px solid var(--border-hairline)">
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="primary" size="sm" disabled="{{ saveDisabled }}" on-click="{{ onSave }}" hint-size="auto,28px">Save preset</x-import>
+    <sc-if value="{{ unsaved }}" hint-placeholder-val="{{ false }}">
+      <span style="font-size:var(--text-xs);color:var(--text-disabled)">unsaved changes</span>
+    </sc-if>
+    <div style="flex:1"></div>
+    <span style="font-size:var(--text-xs);color:var(--text-secondary)">{{ statusText }}</span>
+  </div>
+
+  <sc-if value="{{ modalMidi }}" hint-placeholder-val="{{ false }}">
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Modal" title="MIDI mappings" on-close="{{ closeModal }}" hint-size="100%,100%">
+      <div style="width:680px;max-width:100%;display:flex;flex-direction:column;gap:12px">
+        <span style="font-size:var(--text-xs);color:var(--text-secondary)">Global table, persisted alongside the presets. A binding fires on the press edge only.</span>
+        <div style="max-height:320px;overflow-y:auto;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-inset)">
+          <div style="display:grid;grid-template-columns:110px 130px 1fr 90px;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border-hairline);font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-disabled);position:sticky;top:0;background:var(--bg-surface)">
+            <span>MESSAGE</span><span>ACTION</span><span>TARGET</span><span>RANGE</span>
+          </div>
+          <sc-for list="{{ midiRows }}" as="mr" hint-placeholder-count="6">
+            <div style="display:grid;grid-template-columns:110px 130px 1fr 90px;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border-hairline);font-size:var(--text-xs);color:var(--text-primary)">
+              <span style="font-family:var(--font-mono);color:var(--accent-primary)">{{ mr.message }}</span>
+              <span style="font-family:var(--font-mono);color:var(--text-secondary)">{{ mr.action }}</span>
+              <span>{{ mr.target }}</span>
+              <span style="font-family:var(--font-mono);color:var(--text-disabled)">{{ mr.range }}</span>
+            </div>
+          </sc-for>
+          <sc-if value="{{ midiEmpty }}" hint-placeholder-val="{{ false }}">
+            <span style="display:block;padding:12px;font-size:var(--text-sm);color:var(--text-disabled)">No bindings yet -- press learn next to anything bindable.</span>
+          </sc-if>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-secondary)">{{ midiCount }}</span>
+          <div style="flex:1"></div>
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="secondary" size="sm" on-click="{{ closeModal }}" hint-size="auto,28px">Close</x-import>
+        </div>
+      </div>
+    </x-import>
+  </sc-if>
+
+  <sc-if value="{{ modalTuner }}" hint-placeholder-val="{{ false }}">
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Modal" title="Tuner" on-close="{{ closeModal }}" hint-size="100%,100%">
+      <div style="width:440px;max-width:100%;display:flex;flex-direction:column;align-items:center;gap:16px;padding:8px 0">
+        <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-disabled)">OUTPUT IS MUTED WHILE THE TUNER IS OPEN</span>
+        <span style="font-size:72px;font-weight:600;line-height:1;color:{{ tunerColor }}">{{ tunerNote }}</span>
+        <span style="font-family:var(--font-mono);font-size:var(--text-sm);color:var(--text-secondary)">{{ tunerHz }}</span>
+        <div style="position:relative;width:100%;height:40px;background:var(--bg-inset);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);box-shadow:var(--shadow-inset)">
+          <div style="position:absolute;left:50%;top:4px;bottom:4px;width:1px;background:var(--border-strong)"></div>
+          <div style="position:absolute;left:25%;top:12px;bottom:12px;width:1px;background:var(--border-hairline)"></div>
+          <div style="position:absolute;left:75%;top:12px;bottom:12px;width:1px;background:var(--border-hairline)"></div>
+          <div style="position:absolute;top:4px;bottom:4px;width:3px;border-radius:1px;background:{{ tunerColor }};left:{{ tunerNeedleLeft }}"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;width:100%;font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-disabled)">
+          <span>-50</span><span>-25</span><span>0</span><span>+25</span><span>+50</span>
+        </div>
+        <span style="font-family:var(--font-mono);font-size:var(--text-sm);color:{{ tunerColor }}">{{ tunerCentsText }}</span>
+      </div>
+    </x-import>
+  </sc-if>
+
+  <sc-if value="{{ modalMetro }}" hint-placeholder-val="{{ false }}">
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Modal" title="Metronome" on-close="{{ closeModal }}" hint-size="100%,100%">
+      <div style="width:460px;max-width:100%;display:flex;flex-direction:column;gap:16px">
+        <div style="display:flex;align-items:center;justify-content:center;gap:12px;padding:12px;background:var(--bg-inset);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);box-shadow:var(--shadow-inset)">
+          <sc-for list="{{ metroBeats }}" as="b" hint-placeholder-count="4">
+            <div style="width:14px;height:14px;border-radius:50%;background:{{ b.bg }}"></div>
+          </sc-for>
+          <span style="font-family:var(--font-mono);font-size:var(--text-lg);color:var(--text-primary);margin-left:8px">{{ metroBpmText }}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px">
+          <div style="flex:1;min-width:0">
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="Tempo" value="{{ metroBpmVal }}" min="{{ 40 }}" max="{{ 240 }}" unit=" BPM" on-change="{{ onMetroBpm }}" hint-size="260px,44px"></x-import>
+          </div>
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ metroBpmBound }}" binding-text="{{ metroBpmBinding }}" armed="{{ armed }}" on-click="{{ onLearnMetroBpm }}" hint-size="auto,26px"></x-import>
+        </div>
+        <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Select" placeholder="" label="Time signature" value="{{ metroSig }}" options="{{ metroSigOptions }}" on-change="{{ onMetroSig }}" hint-size="100%,52px"></x-import>
+        <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="Level" value="{{ metroVolVal }}" min="{{ 0 }}" max="{{ 100 }}" unit=" %" on-change="{{ onMetroVol }}" hint-size="100%,44px"></x-import>
+        <div style="display:flex;align-items:center;gap:8px">
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="primary" size="md" on-click="{{ onMetroToggle }}" hint-size="auto,34px">{{ metroToggleLabel }}</x-import>
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="secondary" size="md" on-click="{{ onMetroTap }}" hint-size="auto,34px">Tap tempo</x-import>
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ metroRunBound }}" binding-text="{{ metroRunBinding }}" armed="{{ armed }}" on-click="{{ onLearnMetroRun }}" hint-size="auto,26px"></x-import>
+          <span style="font-size:var(--text-xs);color:var(--text-disabled)">start / stop</span>
+        </div>
+      </div>
+    </x-import>
+  </sc-if>
+
+  <sc-if value="{{ modalSettings }}" hint-placeholder-val="{{ false }}">
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Modal" title="Audio Settings" on-close="{{ closeModal }}" hint-size="100%,100%">
+      <div style="width:520px;max-width:100%;display:flex;flex-direction:column;gap:16px">
+        <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Select" placeholder="" label="Device" value="{{ setDevice }}" options="{{ deviceOptions }}" on-change="{{ onDevice }}" hint-size="100%,52px"></x-import>
+        <sc-if value="{{ deviceUnavailable }}" hint-placeholder-val="{{ false }}">
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.StatusBanner" tone="unavailable" hint-size="100%,36px">Scarlett 2i2 is not connected -- audio will stay on HDA Intel PCH until it appears.</x-import>
+        </sc-if>
+        <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Select" placeholder="" label="Input channels" value="{{ setInputs }}" options="{{ inputOptions }}" on-change="{{ onInputs }}" hint-size="100%,52px"></x-import>
+        <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Select" placeholder="" label="Sample rate" value="{{ setRate }}" options="{{ rateOptions }}" on-change="{{ onRate }}" hint-size="100%,52px"></x-import>
+        <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Select" placeholder="" label="Buffer size" value="{{ setBuffer }}" options="{{ bufferOptions }}" on-change="{{ onBuffer }}" hint-size="100%,52px"></x-import>
+        <span style="font-family:var(--font-mono);font-size:var(--text-sm);color:var(--text-secondary)">{{ latencyText }}</span>
+        <div style="display:flex;justify-content:flex-end;gap:8px">
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="md" on-click="{{ closeModal }}" hint-size="auto,34px">Cancel</x-import>
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="primary" size="md" on-click="{{ onApplySettings }}" hint-size="auto,34px">Apply</x-import>
+        </div>
+      </div>
+    </x-import>
+  </sc-if>
+
+  <sc-if value="{{ modalBrowser }}" hint-placeholder-val="{{ false }}">
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Modal" title="Add stage" on-close="{{ closeModal }}" hint-size="100%,100%">
+      <div style="width:560px;max-width:100%;display:flex;flex-direction:column;gap:12px">
+        <input type="text" value="{{ searchText }}" onChange="{{ onSearch }}" placeholder="Search plugins..." autoFocus="{{ true }}" style="width:100%;box-sizing:border-box;padding:8px 10px;background:var(--bg-inset);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-ui);font-size:var(--text-sm);outline:none">
+        <div style="display:flex;flex-direction:column;gap:2px;height:280px;overflow-y:auto;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);padding:4px;background:var(--bg-inset)">
+          <sc-for list="{{ filteredPlugins }}" as="pl" hint-placeholder-count="5">
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.ListRow" label="{{ pl.name }}" sublabel="{{ pl.sub }}" on-click="{{ pl.onClick }}" hint-size="100%,40px"></x-import>
+          </sc-for>
+          <sc-if value="{{ noMatches }}" hint-placeholder-val="{{ false }}">
+            <span style="padding:8px;font-size:var(--text-sm);color:var(--text-disabled)">Nothing matches that.</span>
+          </sc-if>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-secondary)">{{ shownOf }}</span>
+          <span style="font-size:var(--text-xs);color:var(--text-disabled)">(3 more installed have no audio path)</span>
+          <div style="flex:1"></div>
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ closeModal }}" hint-size="auto,28px">Cancel</x-import>
+        </div>
+      </div>
+    </x-import>
+  </sc-if>
+
+  <sc-if value="{{ modalFile }}" hint-placeholder-val="{{ false }}">
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Modal" title="Choose a file" on-close="{{ closeModal }}" hint-size="100%,100%">
+      <div style="width:560px;max-width:100%;display:flex;flex-direction:column;gap:12px">
+        <span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-secondary);word-break:break-all">{{ pickerPath }}</span>
+        <div style="display:flex;flex-direction:column;gap:2px;height:260px;overflow-y:auto;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);padding:4px;background:var(--bg-inset)">
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.ListRow" label="../" on-click="{{ onPickerUp }}" hint-size="100%,32px"></x-import>
+          <sc-for list="{{ pickerEntries }}" as="fe" hint-placeholder-count="4">
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.ListRow" label="{{ fe.label }}" on-click="{{ fe.onClick }}" hint-size="100%,32px"></x-import>
+          </sc-for>
+          <sc-if value="{{ pickerEmpty }}" hint-placeholder-val="{{ false }}">
+            <span style="padding:8px;font-size:var(--text-sm);color:var(--text-disabled)">Nothing here this plugin can load.</span>
+          </sc-if>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span style="font-size:var(--text-xs);color:var(--text-disabled)">Showing: {{ pickerShowing }}</span>
+          <div style="flex:1"></div>
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="ghost" size="sm" on-click="{{ closeModal }}" hint-size="auto,28px">Cancel</x-import>
+        </div>
+      </div>
+    </x-import>
+  </sc-if>
+
+  <sc-if value="{{ modalPlugin }}" hint-placeholder-val="{{ false }}">
+    <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Modal" title="{{ pmTitle }}" on-close="{{ closeModal }}" hint-size="100%,100%">
+      <div style="width:640px;max-width:100%;display:flex;flex-direction:column;gap:16px">
+        <div style="height:200px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:var(--bg-inset);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);box-shadow:var(--shadow-inset)">
+          <span style="font-size:var(--text-sm);color:var(--text-disabled)">The plugin's own editor (suil embed) renders here.</span>
+          <span style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-disabled)">{{ pmUri }}</span>
+        </div>
+        <span style="font-family:var(--font-mono);font-size:var(--text-2xs);letter-spacing:var(--tracking-wider);color:var(--text-disabled)">GENERIC CONTROLS</span>
+        <sc-for list="{{ pmPaths }}" as="p" hint-placeholder-count="1">
+          <div style="display:flex;align-items:center;gap:12px">
+            <span style="font-size:var(--text-xs);color:var(--text-secondary);min-width:52px" title="{{ p.tooltip }}">{{ p.label }}</span>
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="secondary" size="sm" on-click="{{ p.onPick }}" hint-size="auto,28px">{{ p.fileName }}</x-import>
+          </div>
+        </sc-for>
+        <sc-for list="{{ pmControls }}" as="c" hint-placeholder-count="3">
+          <div style="display:flex;align-items:center;gap:12px">
+            <sc-if value="{{ c.slider }}" hint-placeholder-val="{{ true }}">
+              <div style="flex:1;min-width:0;max-width:420px">
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Slider" label="{{ c.label }}" value="{{ c.value }}" min="{{ c.min }}" max="{{ c.max }}" unit="{{ c.unit }}" logarithmic="{{ c.logarithmic }}" on-change="{{ c.onChange }}" hint-size="260px,44px"></x-import>
+              </div>
+            </sc-if>
+            <sc-if value="{{ c.toggled }}" hint-placeholder-val="{{ false }}">
+              <div style="flex:1;min-width:0">
+                <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Toggle" checked="{{ c.on }}" label="{{ c.label }}" on-change="{{ c.onToggle }}" hint-size="auto,26px"></x-import>
+              </div>
+            </sc-if>
+            <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.IconButton" label="learn" bound="{{ c.bound }}" binding-text="{{ c.binding }}" armed="{{ armed }}" on-click="{{ c.onLearn }}" hint-size="auto,26px"></x-import>
+          </div>
+        </sc-for>
+        <div style="display:flex;justify-content:flex-end">
+          <x-import component-from-global-scope="SignalforgeDesignSystem_cc3c6b.Button" variant="secondary" size="md" on-click="{{ closeModal }}" hint-size="auto,34px">Close</x-import>
+        </div>
+      </div>
+    </x-import>
+  </sc-if>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;clipDemo&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Demo states&quot;},&quot;missingPluginDemo&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Demo states&quot;},&quot;meterMotion&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Demo states&quot;}}">
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    const S = (name, uri, opts) => Object.assign({name, uri, bypassed: false, expanded: false, hasUi: false, bypassBinding: '', paths: [], controls: []}, opts);
+    const ctl = (symbol, name, value, min, max, opts) => Object.assign({symbol, name, value, min, max, unit: '', toggled: false, logarithmic: false, binding: ''}, opts);
+    const gate = () => S('Gate (x42-dpl)', 'http://gareus.org/oss/lv2/dpl#mono', {controls: [ctl('threshold', 'Threshold', -50, -90, -10, {unit: ' dB'}), ctl('release', 'Release', 120, 10, 500, {unit: ' ms', logarithmic: true})]});
+    const ts = () => S('GxTubeScreamer', 'http://guitarix.sourceforge.net/plugins/gx_tubescreamer_', {controls: [ctl('drive', 'Drive', 0.42, 0, 1), ctl('tone', 'Tone', 0.5, 0, 1), ctl('level', 'Level', 0.6, 0, 1), ctl('on', 'On', 1, 0, 1, {toggled: true})]});
+    const nam = (model) => S('Neural Amp Modeler', 'http://github.com/mikeoliphant/neural-amp-modeler-lv2', {hasUi: true, paths: [{label: 'Model', uri: '#model', ext: '.nam', value: model}], controls: [ctl('input_level', 'Input level', 0, -20, 20, {unit: ' dB'}), ctl('output_level', 'Output level', -3, -20, 20, {unit: ' dB'}), ctl('quality_scale', 'Quality', 1, 0, 1)]});
+    const ir = (f) => S('ZeroConvoLV2 (mono)', 'http://gareus.org/oss/lv2/zeroconvolv#CfgMono', {paths: [{label: 'IR', uri: '#ir', ext: '.wav', value: f}], controls: [ctl('wet', 'Wet', 0, -60, 0, {unit: ' dB'}), ctl('dry', 'Dry', -60, -60, 0, {unit: ' dB'}), ctl('enable', 'Enable', 1, 0, 1, {toggled: true})]});
+    const delay = () => S('GxDigitalDelay', 'http://guitarix.sourceforge.net/plugins/gx_digital_delay_', {controls: [ctl('time', 'Time', 380, 20, 2000, {unit: ' ms', logarithmic: true}), ctl('feedback', 'Feedback', 0.35, 0, 1), ctl('mix', 'Mix', 0.25, 0, 1)]});
+    const rev = () => S('Dragonfly Room Reverb', 'urn:dragonfly:room', {hasUi: true, controls: [ctl('dry_level', 'Dry level', 80, 0, 100, {unit: ' %'}), ctl('late_level', 'Late level', 20, 0, 100, {unit: ' %'}), ctl('decay', 'Decay', 0.8, 0.1, 10, {unit: ' s', logarithmic: true})]});
+    const MESA = '/home/fernando/Downloads/Mesa Boogie JP-2C Pack!/JP2C Capture 13 JP RHY CH2 G8 T6 M4 B3 P6 - Emil Rohbe.nam';
+    const PLEXI = '/home/fernando/Downloads/Plexi Pack/Plexi 1959SLP Crunch - Bright Ch.nam';
+    const IR1 = '/home/fernando/IRs/DrmWrld-LD blend+rm mesa 4x12 recto.wav';
+    const IR2 = '/home/fernando/IRs/Greenback25 4x12 SM57.wav';
+    const clean = () => ({split: false, pre: [gate(), nam('/home/fernando/Downloads/Fender Pack/Deluxe Reverb Clean G4.nam'), ir(IR1), rev()], a: [], b: [], post: []});
+    const rhythm = () => ({split: true, pre: [gate(), ts()], a: [nam(MESA), ir(IR1)], b: [nam(PLEXI), ir(IR2)], post: [delay()]});
+    const lead = () => ({split: false, pre: [gate(), ts(), nam(MESA), ir(IR1), delay(), rev()], a: [], b: [], post: []});
+    const clone = (o) => JSON.parse(JSON.stringify(o));
+    const chains = {'01-clean': clean(), '02-rhythm': rhythm(), '03-lead': lead(),
+      'w1': clone(clean()), 'w2': clone(clean()), 'w3': clone(rhythm()), 'w4': clone(lead()),
+      'c1': clone(rhythm()), 'c2': clone(lead()), 'c3': clone(clean())};
+    this.state = {
+      view: 'board', bank: 0, preset: 1, chains,
+      banks: [
+        {name: 'Default', presets: [{name: 'Clean', stem: '01-clean', binding: 'PC 0'}, {name: 'Rhythm', stem: '02-rhythm', binding: 'PC 1'}, {name: 'Lead', stem: '03-lead', binding: 'PC 2'}]},
+        {name: 'Worship set', presets: [{name: 'Ambient', stem: 'w1', binding: 'PC 3'}, {name: 'Swell', stem: 'w2', binding: ''}, {name: 'Drive', stem: 'w3', binding: ''}, {name: 'Big lead', stem: 'w4', binding: ''}]},
+        {name: 'Covers', presets: [{name: 'Crunch', stem: 'c1', binding: ''}, {name: 'Solo', stem: 'c2', binding: ''}, {name: 'Octave', stem: 'c3', binding: ''}]}
+      ],
+      learning: null, modal: null, unsaved: false,
+      status: "Loaded preset 'Rhythm' from presets/02-rhythm.json",
+      search: '', pickerDir: '', pickerExt: '', pickerTarget: null,
+      inputDb: -18.4, outputDb: -9.2,
+      nextBinding: 'CC 80', prevBinding: 'CC 81', bankBinding: '',
+      device: 'HDA Intel PCH', rate: '48000 Hz', buffer: '128 frames'
+    };
+    this.catalog = [
+      {name: 'Neural Amp Modeler', uri: 'http://github.com/mikeoliphant/neural-amp-modeler-lv2', io: '1 in / 1 out', mk: nam ? () => nam('') : null},
+      {name: 'ZeroConvoLV2 (mono)', uri: 'http://gareus.org/oss/lv2/zeroconvolv#CfgMono', io: '1 in / 1 out', mk: () => ir('')},
+      {name: 'Gate (x42-dpl)', uri: 'http://gareus.org/oss/lv2/dpl#mono', io: '1 in / 1 out', mk: gate},
+      {name: 'GxTubeScreamer', uri: 'http://guitarix.sourceforge.net/plugins/gx_tubescreamer_', io: '1 in / 1 out', mk: ts},
+      {name: 'GxDigitalDelay', uri: 'http://guitarix.sourceforge.net/plugins/gx_digital_delay_', io: '1 in / 1 out', mk: delay},
+      {name: 'Dragonfly Room Reverb', uri: 'urn:dragonfly:room', io: '2 in / 2 out', mk: rev},
+      {name: 'Guitarix Compressor', uri: 'http://guitarix.sourceforge.net/plugins/gx_compressor_', io: '1 in / 1 out', mk: () => S('Guitarix Compressor', 'http://guitarix.sourceforge.net/plugins/gx_compressor_', {controls: [ctl('ratio', 'Ratio', 4, 1, 20), ctl('threshold', 'Threshold', -20, -60, 0, {unit: ' dB'}), ctl('attack', 'Attack', 2, 0.1, 100, {unit: ' ms', logarithmic: true})]})},
+      {name: 'x42 Parametric EQ', uri: 'http://gareus.org/oss/lv2/fil4#mono', io: '1 in / 1 out', mk: () => S('x42 Parametric EQ', 'http://gareus.org/oss/lv2/fil4#mono', {controls: [ctl('freq1', 'Freq 1', 400, 20, 20000, {unit: ' Hz', logarithmic: true}), ctl('gain1', 'Gain 1', 0, -18, 18, {unit: ' dB'}), ctl('q1', 'Q 1', 0.7, 0.1, 8)]})},
+      {name: 'MDA Wah', uri: 'http://drobilla.net/plugins/mda/Wah', io: '1 in / 1 out', mk: () => S('MDA Wah', 'http://drobilla.net/plugins/mda/Wah', {controls: [ctl('wah', 'Wah', 0.5, 0, 1), ctl('rate', 'Rate', 2, 0.1, 10, {unit: ' Hz'})]})},
+      {name: 'TAL Chorus', uri: 'urn:tal:chorus', io: '2 in / 2 out', mk: () => S('TAL Chorus', 'urn:tal:chorus', {controls: [ctl('wet', 'Wet', 0.4, 0, 1), ctl('rate', 'Rate', 1.2, 0.1, 5, {unit: ' Hz'})]})}
+    ];
+    this.fs = {
+      '/home/fernando': [{name: 'Downloads', dir: true}, {name: 'IRs', dir: true}],
+      '/home/fernando/Downloads': [{name: 'Mesa Boogie JP-2C Pack!', dir: true}, {name: 'Plexi Pack', dir: true}, {name: 'Fender Pack', dir: true}],
+      '/home/fernando/Downloads/Mesa Boogie JP-2C Pack!': [
+        {name: 'JP2C Capture 13 JP RHY CH2 G8 T6 M4 B3 P6 - Emil Rohbe.nam'},
+        {name: 'JP2C Capture 16 JP LD CH3 G9 T7 M5 B4 - Emil Rohbe.nam'},
+        {name: 'JP2C Capture 02 Clean CH1 G3 - Emil Rohbe.nam'},
+        {name: 'README.txt'}],
+      '/home/fernando/Downloads/Plexi Pack': [
+        {name: 'Plexi 1959SLP Crunch - Bright Ch.nam'},
+        {name: 'Plexi 1959SLP Cranked - Jumped.nam'}],
+      '/home/fernando/Downloads/Fender Pack': [
+        {name: 'Deluxe Reverb Clean G4.nam'},
+        {name: 'Twin Reverb Edge of Breakup.nam'}],
+      '/home/fernando/IRs': [
+        {name: 'DrmWrld-LD blend+rm mesa 4x12 recto.wav'},
+        {name: 'Greenback25 4x12 SM57.wav'},
+        {name: 'OwnHammer 412 MES V30.wav'},
+        {name: 'notes.txt'}]
+    };
+  }
+  componentDidMount() {
+    this._meter = setInterval(() => {
+      if ((this.props.meterMotion ?? true) === false) return;
+      const wob = () => (Math.random() - 0.5) * 6;
+      const inDb = Math.max(-40, Math.min(-6, -18 + wob() * 1.5));
+      const outDb = Math.max(-30, Math.min(-1.2, -9 + wob()));
+      const upd = {inputDb: inDb, outputDb: outDb,
+        peakIn: Math.max(inDb, (this.state.peakIn ?? -60) - 1.2),
+        peakOut: Math.max(outDb, (this.state.peakOut ?? -60) - 1.2),
+        dsp: Math.max(18, Math.min(72, (this.state.dsp ?? 34) * 0.7 + (34 + wob() * 3) * 0.3))};
+      if (this.state.modal && this.state.modal.type === 'tuner') {
+        upd.tunerCents = (this.state.tunerCents ?? -18) * 0.75 + (Math.random() - 0.5) * 10;
+      }
+      this.setState(upd);
+    }, 450);
+  }
+  componentWillUnmount() { clearInterval(this._meter); if (this._learnT) clearTimeout(this._learnT); if (this._metroT) clearInterval(this._metroT); }
+  startMetro(bpm, sig) {
+    if (this._metroT) clearInterval(this._metroT);
+    const beats = parseInt(sig) || 4;
+    this._metroT = setInterval(() => this.setState({metroBeat: ((this.state.metroBeat ?? 0) + 1) % beats}), 60000 / bpm);
+  }
+  chain() { return this.state.chains[this.curPreset().stem]; }
+  curBank() { return this.state.banks[this.state.bank]; }
+  curPreset() { return this.curBank().presets[this.state.preset]; }
+  totalStages(ch) { return ch.pre.length + ch.a.length + ch.b.length + ch.post.length; }
+  loadPreset(bankIdx, i) {
+    const p = this.state.banks[bankIdx].presets[i];
+    this.setState({bank: bankIdx, preset: i, unsaved: false, status: "Loaded preset '" + p.name + "' from presets/" + p.stem + ".json"});
+  }
+  arm(what, apply) {
+    if (this.state.learning) return;
+    this.setState({learning: {what}});
+    this._learnT = setTimeout(() => {
+      const b = 'CC ' + (82 + Math.floor(Math.random() * 12)) + ' (ch 1)';
+      apply(b);
+      this.setState({learning: null, status: 'Bound ' + b + ' to ' + what + '.'});
+    }, 2200);
+  }
+  openPicker(st, p) {
+    const cut = (p.value || '').lastIndexOf('/');
+    const dir = cut > 0 ? p.value.substring(0, cut) : (p.ext === '.wav' ? '/home/fernando/IRs' : '/home/fernando/Downloads');
+    this.setState({modal: {type: 'file'}, pickerDir: this.fs[dir] ? dir : '/home/fernando', pickerExt: p.ext || '', pickerTarget: p});
+  }
+  mkMeter(label, db, peak, clipping) {
+    const n = 28;
+    const segs = Array.from({length: n}, (_, i) => {
+      const segDb = -60 + (i + 0.5) * (60 / n);
+      let bg = 'var(--gray-800)';
+      if (clipping || db >= segDb) {
+        bg = segDb < -12 ? 'var(--meter-comfortable)' : segDb < -6 ? 'var(--meter-warn)' : 'var(--meter-hot)';
+        if (clipping && segDb >= -3) bg = 'var(--meter-clip)';
+      }
+      return {bg};
+    });
+    return {label, segs,
+      peakLeft: Math.max(0, Math.min(99, (peak + 60) / 60 * 100)).toFixed(1) + '%',
+      dbText: (clipping ? 0.8 : db).toFixed(1) + ' dB',
+      dbColor: clipping ? 'var(--meter-clip)' : 'var(--text-primary)'};
+  }
+  mkSend(sp, key, bKey, what) {
+    if (!sp) return {};
+    if (sp[key] === undefined) sp[key] = 0;
+    if (sp[bKey] === undefined) sp[bKey] = '';
+    return {
+      value: sp[key], min: -60, max: 6,
+      onChange: (v) => { sp[key] = v; this.setState({unsaved: true}); },
+      bound: !!sp[bKey], binding: sp[bKey],
+      onLearn: () => this.arm(what, (b) => { sp[bKey] = b; })
+    };
+  }
+  mkStageVM(lane, arr, idx, label) {
+    const st = arr[idx];
+    const ch = this.chain();
+    const touch = (status) => this.setState({unsaved: true, status: status || this.state.status});
+    return {
+      label, name: st.name, bypassed: st.bypassed, expanded: st.expanded, hasUi: st.hasUi,
+      uri: st.uri, enabled: !st.bypassed, arrow: st.expanded ? '\u25be' : '\u25b8',
+      nameColor: st.bypassed ? 'var(--text-disabled)' : 'var(--text-primary)',
+      armed: !!this.state.learning,
+      bypassBound: !!st.bypassBinding, bypassBinding: st.bypassBinding,
+      onToggleExpand: () => { st.expanded = !st.expanded; this.forceUpdate(); },
+      onToggleBypass: () => { st.bypassed = !st.bypassed; touch((st.bypassed ? 'Bypassed ' : 'Enabled ') + st.name + '.'); },
+      onMoveUp: () => { if (idx === 0) return; [arr[idx - 1], arr[idx]] = [arr[idx], arr[idx - 1]]; touch(); },
+      onMoveDown: () => { if (idx + 1 >= arr.length) return; [arr[idx + 1], arr[idx]] = [arr[idx], arr[idx + 1]]; touch(); },
+      onRemove: () => {
+        if (this.totalStages(ch) <= 1) { this.setState({status: 'A chain needs at least one stage.'}); return; }
+        arr.splice(idx, 1); touch('Removed ' + st.name + ' from the chain.');
+      },
+      onOpenUi: () => this.setState({modal: {type: 'plugin', lane, idx}}),
+      onLearnBypass: () => this.arm('bypass on ' + st.name, (b) => { st.bypassBinding = b; }),
+      paths: st.paths.map((p) => ({
+        label: p.label,
+        fileName: p.value ? p.value.substring(p.value.lastIndexOf('/') + 1) : '(none) -- choose...',
+        tooltip: p.value || p.uri,
+        onPick: () => this.openPicker(st, p)
+      })),
+      controls: st.controls.map((c) => ({
+        label: c.name, toggled: c.toggled, slider: !c.toggled,
+        on: c.value > (c.min + c.max) / 2,
+        value: c.value, min: c.min, max: c.max, unit: c.unit, logarithmic: c.logarithmic,
+        bound: !!c.binding, binding: c.binding,
+        onChange: (v) => { c.value = v; this.setState({unsaved: true}); },
+        onToggle: (on) => { c.value = on ? c.max : c.min; this.setState({unsaved: true}); },
+        onLearn: () => this.arm(st.name + ' / ' + c.name, (b) => { c.binding = b; })
+      }))
+    };
+  }
+  renderVals() {
+    const s = this.state;
+    const ch = this.chain();
+    const bank = this.curBank();
+    const preset = this.curPreset();
+    const tabBase = {padding: '6px 16px', fontFamily: 'var(--font-ui)', fontSize: '13px', border: '1px solid var(--border-hairline)', cursor: 'pointer', background: 'var(--bg-surface)', color: 'var(--text-secondary)'};
+    const tabOn = {background: 'var(--bg-surface-raised)', color: 'var(--accent-primary)', borderColor: 'var(--border-strong)'};
+    const isBoard = s.view === 'board';
+    const postStart = ch.pre.length + ch.a.length + ch.b.length;
+    const nextIdx = (s.preset + 1) % bank.presets.length;
+    const prevIdx = (s.preset - 1 + bank.presets.length) % bank.presets.length;
+    const bindings = 3 + (s.nextBinding ? 1 : 0) + (s.prevBinding ? 1 : 0) + (s.bankBinding ? 1 : 0);
+    const latency = (parseInt(s.buffer) / parseInt(s.rate) * 2 * 1000);
+    const clipping = (this.props.clipDemo ?? false) || s.outputDb >= 0;
+    if (ch.split && !ch.mix) ch.mix = {a: 0, b: 0, aB: '', bB: ''};
+    if (ch.split && !ch.splitCfg) ch.splitCfg = {mode: 'Full range (copy)', freq: 800, freqB: ''};
+    const sp = ch.splitCfg;
+    const mkMix = (key, bKey, what) => ch.mix ? {
+      value: ch.mix[key], min: -60, max: 6,
+      onChange: (v) => { ch.mix[key] = v; this.setState({unsaved: true}); },
+      bound: !!ch.mix[bKey], binding: ch.mix[bKey],
+      onLearn: () => this.arm(what, (b) => { ch.mix[bKey] = b; })
+    } : {};
+    const midiRows = [];
+    const addRow = (msg, action, target, range) => { if (msg) midiRows.push({message: msg, action, target, range: range || '--'}); };
+    s.banks.forEach((bk) => bk.presets.forEach((p) => addRow(p.binding, 'load_preset', bk.name + ' / ' + p.name, '')));
+    addRow(s.nextBinding, 'next_preset', 'preset library', '');
+    addRow(s.prevBinding, 'prev_preset', 'preset library', '');
+    addRow(s.bankBinding, 'next_bank', 'bank list', '');
+    const walk = (lane, arr) => arr.forEach((st, i) => {
+      addRow(st.bypassBinding, 'toggle_bypass', lane + i + '. ' + st.name, '');
+      st.controls.forEach((c) => addRow(c.binding, 'set_control', lane + i + '. ' + st.name + ' / ' + c.name, c.min + '..' + c.max));
+    });
+    walk('', ch.pre); walk('A', ch.a); walk('B', ch.b); walk('', ch.post);
+    if (ch.mix) { addRow(ch.mix.aB, 'set_control', 'mixer / Level A', '-60..6'); addRow(ch.mix.bB, 'set_control', 'mixer / Level B', '-60..6'); }
+    if (ch.splitCfg) {
+      addRow(ch.splitCfg.freqB, 'set_control', 'splitter / Crossover', '20..20000');
+      addRow(ch.splitCfg.sendAB, 'set_control', 'splitter / Send A', '-60..6');
+      addRow(ch.splitCfg.sendBB, 'set_control', 'splitter / Send B', '-60..6');
+    }
+    addRow(s.inGainB, 'set_control', 'levels / Input gain', '-24..24');
+    addRow(s.outGainB, 'set_control', 'levels / Output gain', '-24..24');
+    addRow(s.metroBpmB, 'set_control', 'metronome / Tempo', '40..240');
+    addRow(s.metroRunB, 'toggle_metronome', 'metronome', '');
+    const modal = s.modal || {};
+    let pm = null;
+    if (modal.type === 'plugin') {
+      const arr = ch[modal.lane];
+      if (arr && arr[modal.idx]) pm = this.mkStageVM(modal.lane, arr, modal.idx, '');
+    }
+    const needle = s.search.toLowerCase();
+    const filtered = this.catalog.filter((p) => !needle || p.name.toLowerCase().includes(needle) || p.uri.toLowerCase().includes(needle));
+    const targetLane = modal.type === 'browser' ? modal.lane : 'pre';
+    const entries = (this.fs[s.pickerDir] || []).filter((e) => e.dir || !s.pickerExt || e.name.endsWith(s.pickerExt));
+    return {
+      missingPluginDemo: this.props.missingPluginDemo ?? false,
+      bankName: bank.name, bankNameUpper: bank.name.toUpperCase(),
+      presetName: preset.name, presetPath: 'presets/' + preset.stem + '.json',
+      isBoard, isLive: !isBoard,
+      boardTabStyle: Object.assign({}, tabBase, {borderRadius: '3px 0 0 3px'}, isBoard ? tabOn : {}),
+      liveTabStyle: Object.assign({}, tabBase, {borderRadius: '0 3px 3px 0', borderLeft: 'none'}, !isBoard ? tabOn : {}),
+      showBoard: () => this.setState({view: 'board'}),
+      showLive: () => this.setState({view: 'live'}),
+      openSettings: () => this.setState({modal: {type: 'settings'}}),
+      closeModal: () => this.setState({modal: null}),
+      learning: !!s.learning, learningWhat: s.learning ? s.learning.what : '',
+      armed: !!s.learning,
+      cancelLearn: () => { if (this._learnT) clearTimeout(this._learnT); this.setState({learning: null, status: 'MIDI learn cancelled.'}); },
+      bankNames: s.banks.map((b) => b.name),
+      onBankChange: (name) => { if (!name) return; const i = s.banks.findIndex((b) => b.name === name); if (i >= 0) this.loadPreset(i, 0); },
+      bankBound: !!s.bankBinding, bankBinding: s.bankBinding,
+      onLearnBank: () => this.arm('next bank', (b) => this.setState({bankBinding: b})),
+      presetCount: bank.presets.length + ' of ' + bank.presets.length,
+      nextBound: !!s.nextBinding, nextBinding: s.nextBinding,
+      prevBound: !!s.prevBinding, prevBinding: s.prevBinding,
+      onLearnNext: () => this.arm('next preset', (b) => this.setState({nextBinding: b})),
+      onLearnPrev: () => this.arm('previous preset', (b) => this.setState({prevBinding: b})),
+      presetRows: bank.presets.map((p, i) => ({
+        label: p.name, sublabel: p.stem + '.json', selected: i === s.preset,
+        onClick: () => this.loadPreset(s.bank, i),
+        bound: !!p.binding, binding: p.binding,
+        onLearn: () => this.arm("preset '" + p.name + "'", (b) => { p.binding = b; })
+      })),
+      engineRows: [['Sample rate', s.rate], ['Block size', s.buffer], ['Latency', latency.toFixed(1) + ' ms round trip'], ['MIDI bindings', String(midiRows.length)], ['Controller', 'FCB1010 (connected)']],
+      meters: [this.mkMeter('Input', s.inputDb + (s.inGain ?? 0), (s.peakIn ?? -14) + (s.inGain ?? 0), false), this.mkMeter('Output', clipping ? 0.8 : s.outputDb + (s.outGain ?? 0), clipping ? 0.8 : (s.peakOut ?? -7) + (s.outGain ?? 0), clipping)],
+      inGain: {value: s.inGain ?? 0, min: -24, max: 24,
+        onChange: (v) => this.setState({inGain: v}),
+        bound: !!s.inGainB, binding: s.inGainB || '',
+        onLearn: () => this.arm('global input gain', (b) => this.setState({inGainB: b}))},
+      outGain: {value: s.outGain ?? 0, min: -24, max: 24,
+        onChange: (v) => this.setState({outGain: v}),
+        bound: !!s.outGainB, binding: s.outGainB || '',
+        onLearn: () => this.arm('global output gain', (b) => this.setState({outGainB: b}))},
+      clipping,
+      stagesPre: ch.pre.map((st, i) => this.mkStageVM('pre', ch.pre, i, String(i))),
+      stagesA: ch.a.map((st, i) => this.mkStageVM('a', ch.a, i, 'A' + i)),
+      stagesB: ch.b.map((st, i) => this.mkStageVM('b', ch.b, i, 'B' + i)),
+      stagesPost: ch.post.map((st, i) => this.mkStageVM('post', ch.post, i, String(postStart + i))),
+      isSplit: ch.split, notSplit: !ch.split,
+      mixA: mkMix('a', 'aB', 'merge level A'),
+      mixB: mkMix('b', 'bB', 'merge level B'),
+      mixerOpen: s.mixerOpen ?? true,
+      mixerArrow: (s.mixerOpen ?? true) ? '\u25be' : '\u25b8',
+      mixerSummary: (s.mixerOpen ?? true) ? 'channel levels into the merge'
+        : (ch.mix ? 'A ' + ch.mix.a.toFixed(1) + ' dB / B ' + ch.mix.b.toFixed(1) + ' dB' : ''),
+      toggleMixer: () => this.setState({mixerOpen: !(s.mixerOpen ?? true)}),
+      splitterOpen: s.splitterOpen ?? true,
+      splitterArrow: (s.splitterOpen ?? true) ? '\u25be' : '\u25b8',
+      splitterSummary: (s.splitterOpen ?? true) ? 'how the signal divides into A and B'
+        : (sp ? (sp.mode === 'Frequency crossover' ? 'crossover at ' + Math.round(sp.freq) + ' Hz'
+          : sp.mode === 'Stereo input (L / R)' ? (sp.srcA ?? 'Left input') + ' / ' + (sp.srcB ?? 'Right input')
+          : 'full range into both channels') : ''),
+      toggleSplitter: () => this.setState({splitterOpen: !(s.splitterOpen ?? true)}),
+      splitMode: sp ? sp.mode : '', splitModeOptions: ['Full range (copy)', 'Frequency crossover', 'Stereo input (L / R)'],
+      splitStereo: !!sp && sp.mode === 'Stereo input (L / R)',
+      onSplitMode: (v) => {
+        if (!v) return;
+        sp.mode = v;
+        const msg = v === 'Frequency crossover' ? 'Splitting by frequency at ' + Math.round(sp.freq) + ' Hz.'
+          : v === 'Stereo input (L / R)' ? 'Channel A takes the left input, channel B takes the right.'
+          : 'Both channels get the full signal.';
+        this.setState({unsaved: true, status: msg});
+      },
+      splitByFreq: !!sp && sp.mode === 'Frequency crossover',
+      onUnsplit: () => {
+        ch.pre = ch.pre.concat(ch.a, ch.b, ch.post);
+        ch.a = []; ch.b = []; ch.post = []; ch.split = false;
+        this.setState({unsaved: true, status: 'Collapsed to one channel -- every stage now runs in series.'});
+      },
+      oneChStyle: Object.assign({}, tabBase, {borderRadius: '3px 0 0 3px', whiteSpace: 'nowrap', flex: 'none'}, ch.split ? {} : tabOn),
+      twoChStyle: Object.assign({}, tabBase, {borderRadius: '0 3px 3px 0', borderLeft: 'none', whiteSpace: 'nowrap', flex: 'none'}, ch.split ? tabOn : {}),
+      channelNote: ch.split
+        ? 'Two parallel channels, each with its own amp, merged back through the mixer.'
+        : ((ch.a.length + ch.b.length) > 0 ? '' : 'One series chain from input to output.'),
+      splitFull: !!sp && sp.mode === 'Full range (copy)',
+      srcOptions: ['Left input', 'Right input', 'Sum (L+R)'],
+      srcA: sp ? (sp.srcA ?? 'Left input') : '',
+      srcB: sp ? (sp.srcB ?? 'Right input') : '',
+      onSrcA: (v) => { if (!v) return; sp.srcA = v; this.setState({unsaved: true}); },
+      onSrcB: (v) => { if (!v) return; sp.srcB = v; this.setState({unsaved: true}); },
+      stereoNote: (s.inputPorts ?? 2) === 1
+        ? 'The interface is providing one input channel -- both channels will receive the same signal until a stereo input is selected in Audio settings.'
+        : 'Each channel takes one side of the stereo input.',
+      sendA: this.mkSend(sp, 'sendA', 'sendAB', 'send level into channel A'),
+      sendB: this.mkSend(sp, 'sendB', 'sendBB', 'send level into channel B'),
+      splitFreq: sp ? {
+        value: sp.freq, min: 20, max: 20000,
+        onChange: (v) => { sp.freq = v; this.setState({unsaved: true}); },
+        bound: !!sp.freqB, binding: sp.freqB,
+        onLearn: () => this.arm('split crossover frequency', (b) => { sp.freqB = b; })
+      } : {},
+      onSplit: () => { ch.split = true; this.setState({unsaved: true, status: 'Signal split into channels A and B after the input stages.'}); },
+      onAddPre: () => this.setState({modal: {type: 'browser', lane: 'pre'}, search: ''}),
+      onAddA: () => this.setState({modal: {type: 'browser', lane: 'a'}, search: ''}),
+      onAddB: () => this.setState({modal: {type: 'browser', lane: 'b'}, search: ''}),
+      onAddPost: () => this.setState({modal: {type: 'browser', lane: 'post'}, search: ''}),
+      saveDisabled: !s.unsaved,
+      unsaved: s.unsaved,
+      onSave: () => this.setState({unsaved: false, status: "Saved preset '" + preset.name + "' to presets/" + preset.stem + '.json'}),
+      statusText: s.status,
+      nextPresetName: bank.presets[nextIdx].name,
+      onNextPreset: () => this.loadPreset(s.bank, nextIdx),
+      onPrevPreset: () => this.loadPreset(s.bank, prevIdx),
+      liveTiles: bank.presets.map((p, i) => ({
+        name: p.name, binding: p.binding || 'unbound', active: i === s.preset, inactive: i !== s.preset,
+        onClick: () => this.loadPreset(s.bank, i)
+      })),
+      openMidi: () => this.setState({modal: {type: 'midi'}}),
+      modalMidi: modal.type === 'midi',
+      midiRows: midiRows, midiEmpty: midiRows.length === 0,
+      midiCount: midiRows.length + ' bindings',
+      openTuner: () => this.setState({modal: {type: 'tuner'}}),
+      openMetro: () => this.setState({modal: {type: 'metro'}}),
+      modalTuner: modal.type === 'tuner',
+      modalMetro: modal.type === 'metro',
+      tunerNote: 'E2',
+      tunerHz: (82.41 * Math.pow(2, (s.tunerCents ?? -18) / 1200)).toFixed(1) + ' Hz',
+      tunerColor: Math.abs(s.tunerCents ?? -18) <= 5 ? 'var(--meter-comfortable)' : 'var(--status-warning)',
+      tunerNeedleLeft: Math.max(1, Math.min(98, 50 + (s.tunerCents ?? -18))).toFixed(1) + '%',
+      tunerCentsText: ((s.tunerCents ?? -18) > 0 ? '+' : '') + (s.tunerCents ?? -18).toFixed(0) + ' cents',
+      metroBpmVal: s.metroBpm ?? 120,
+      metroBpmText: Math.round(s.metroBpm ?? 120) + ' BPM',
+      onMetroBpm: (v) => { this.setState({metroBpm: v}); if (s.metroRun) this.startMetro(v, s.metroSig ?? '4/4'); },
+      metroSig: s.metroSig ?? '4/4', metroSigOptions: ['4/4', '3/4', '6/8', '2/4'],
+      onMetroSig: (v) => { if (!v) return; this.setState({metroSig: v, metroBeat: 0}); if (s.metroRun) this.startMetro(s.metroBpm ?? 120, v); },
+      metroVolVal: s.metroVol ?? 80,
+      onMetroVol: (v) => this.setState({metroVol: v}),
+      metroBeats: Array.from({length: parseInt(s.metroSig ?? '4/4') || 4}, (_, i) => ({bg: (s.metroRun && i === (s.metroBeat ?? 0)) ? 'var(--accent-primary)' : 'var(--gray-700)'})),
+      metroToggleLabel: s.metroRun ? 'Stop' : 'Start',
+      onMetroToggle: () => {
+        if (s.metroRun) { if (this._metroT) clearInterval(this._metroT); this.setState({metroRun: false, metroBeat: 0}); }
+        else { this.startMetro(s.metroBpm ?? 120, s.metroSig ?? '4/4'); this.setState({metroRun: true, metroBeat: 0}); }
+      },
+      onMetroTap: () => {
+        const now = Date.now();
+        this._taps = (this._taps || []).filter((t) => now - t < 3000);
+        this._taps.push(now);
+        if (this._taps.length >= 2) {
+          const gaps = this._taps.slice(1).map((t, i) => t - this._taps[i]);
+          const bpm = Math.max(40, Math.min(240, 60000 / (gaps.reduce((a, b) => a + b, 0) / gaps.length)));
+          this.setState({metroBpm: bpm});
+          if (s.metroRun) this.startMetro(bpm, s.metroSig ?? '4/4');
+        }
+      },
+      metroBpmBound: !!s.metroBpmB, metroBpmBinding: s.metroBpmB || '',
+      onLearnMetroBpm: () => this.arm('metronome tempo', (b) => this.setState({metroBpmB: b})),
+      metroRunBound: !!s.metroRunB, metroRunBinding: s.metroRunB || '',
+      onLearnMetroRun: () => this.arm('metronome start/stop', (b) => this.setState({metroRunB: b})),
+      dspSegs: Array.from({length: 28}, (_, i) => {
+        const segPct = (i + 0.5) * (100 / 28);
+        let bg = 'var(--gray-800)';
+        if ((s.dsp ?? 34) >= segPct) bg = segPct < 60 ? 'var(--meter-comfortable)' : segPct < 80 ? 'var(--meter-warn)' : 'var(--meter-hot)';
+        return {bg};
+      }),
+      dspText: Math.round(s.dsp ?? 34) + ' %',
+      modalSettings: modal.type === 'settings',
+      modalBrowser: modal.type === 'browser',
+      modalFile: modal.type === 'file',
+      modalPlugin: modal.type === 'plugin' && !!pm,
+      setDevice: s.device, deviceOptions: ['HDA Intel PCH', 'USB Audio CODEC', 'Scarlett 2i2 (not connected)'],
+      onDevice: (v) => { if (v) this.setState({device: v}); },
+      deviceUnavailable: s.device.indexOf('not connected') >= 0,
+      setInputs: (s.inputPorts ?? 2) === 1 ? 'Mono (1 in)' : 'Stereo (2 in)',
+      inputOptions: ['Mono (1 in)', 'Stereo (2 in)'],
+      onInputs: (v) => { if (v) this.setState({inputPorts: v.indexOf('Mono') === 0 ? 1 : 2}); },
+      setRate: s.rate, rateOptions: ['44100 Hz', '48000 Hz', '96000 Hz'], onRate: (v) => { if (v) this.setState({rate: v}); },
+      setBuffer: s.buffer, bufferOptions: ['64 frames', '128 frames', '256 frames', '512 frames'], onBuffer: (v) => { if (v) this.setState({buffer: v}); },
+      latencyText: latency.toFixed(1) + ' ms round trip at ' + s.buffer + ' / ' + s.rate,
+      onApplySettings: () => this.setState({modal: null, status: 'Audio engine restarted: ' + s.device + ', ' + s.rate + ', ' + s.buffer + '.'}),
+      searchText: s.search,
+      onSearch: (e) => this.setState({search: e.target.value}),
+      filteredPlugins: filtered.map((p) => ({
+        name: p.name, sub: p.uri + ' -- ' + p.io,
+        onClick: () => {
+          const st = p.mk ? p.mk() : null;
+          if (st) { ch[targetLane].push(st); }
+          this.setState({modal: null, unsaved: true, status: 'Added ' + p.name + ' to the chain.'});
+        }
+      })),
+      noMatches: filtered.length === 0,
+      shownOf: filtered.length + ' of ' + this.catalog.length,
+      pickerPath: s.pickerDir || '/',
+      pickerShowing: s.pickerExt || 'all files',
+      onPickerUp: () => {
+        const cut = s.pickerDir.lastIndexOf('/');
+        const up = cut > 0 ? s.pickerDir.substring(0, cut) : '/home/fernando';
+        this.setState({pickerDir: this.fs[up] ? up : '/home/fernando'});
+      },
+      pickerEntries: entries.map((e) => ({
+        label: e.dir ? e.name + '/' : e.name,
+        onClick: () => {
+          if (e.dir) { this.setState({pickerDir: s.pickerDir + '/' + e.name}); return; }
+          if (s.pickerTarget) s.pickerTarget.value = s.pickerDir + '/' + e.name;
+          this.setState({modal: null, unsaved: true, status: 'Loaded ' + e.name + '.'});
+        }
+      })),
+      pickerEmpty: entries.length === 0,
+      pmTitle: pm ? pm.name + ' -- plugin UI' : '', pmUri: pm ? (ch[modal.lane] && ch[modal.lane][modal.idx] ? ch[modal.lane][modal.idx].uri : '') : '',
+      pmPaths: pm ? pm.paths : [], pmControls: pm ? pm.controls : []
+    };
+  }
+}
+</script>
+</body>
+</html>
