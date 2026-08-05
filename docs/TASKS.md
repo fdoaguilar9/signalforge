@@ -3213,7 +3213,61 @@ does and sit *after* a preamp; that would be a stage, not this.
   *Acceptance: collapse and expand is a round trip -- same trunk, same pedals on
   the same channels in the same order, same splitter and levels.*
 
-**Verification.** `ctest` is green: 30 tests, one new.
+- [x] **SF-87**: A two-channel pedal can be added to a one-channel board. It
+  could not be: the add was refused, the board was left as it was, and the only
+  account of why went to stderr -- `Cannot switch: new chain is 1 in / 2 out,
+  but the JACK ports are 1 in / 1 out`. On screen it read `Could not apply that
+  change:` and then nothing, because `switch_to_preset` reported an `error`
+  string the refusal never wrote to.
+
+  **The adapters were never the problem.** `Planner::Adapt` had done this since
+  SF-48: mono into a stereo pedal duplicates, stereo into a mono one folds at
+  half, and the round trip is unity. What was wrong is that the *board's own
+  edge* was whatever the last pedal produced -- `out.output_buses =
+  output.channels`. So a stereo pedal widened the board, not just the signal
+  between two pedals, and the engine registers JACK ports once and refuses any
+  chain that does not match them.
+
+  The board's width is now a property of the board. The output is pinned to two
+  channels (`kBoardOutputs`) by running the existing adapter once more at the
+  end of the plan; the input is resolved from `board_inputs` once at startup
+  instead of re-read from the first pedal on every rebuild. Neither end moves,
+  so no arrangement of pedals can be refused for width.
+
+  That made the engine's mono→stereo output mirror dead, and it is gone. It was
+  a `memcpy` into a second JACK port that carried no trim of its own and never
+  reached the peak or clip meters; `out_2` is a planned channel now, metered and
+  crossfaded like the first.
+
+  A port count is not a channel count, which is the same mistake in a second
+  place: an audio input marked `lv2:isSideChain` was being counted as a channel,
+  so a mono compressor with a key input looked like a stereo pedal and -- on a
+  stereo board -- would have been keyed off the right channel. A *stereo*
+  compressor reports three audio inputs and was refused outright as unadaptable.
+  Sidechains are now left out of the count and fed the pedal's first real input,
+  which self-keys: what a compressor on a pedalboard is expected to do, and the
+  only signal a board like this has to offer.
+
+  `SwitchHost`/`SwapHost` hand back their refusal text, so the next refusal --
+  which can no longer be about width -- is legible without a terminal.
+
+  *Acceptance: adding, removing or moving a two-channel pedal on a one-channel
+  board is accepted, and the JACK port count is the same before and after.*
+
+**Verification.** `ctest` is green: 31 tests, one new.
+
+`chain_schedule_test` gained `TestBoardWidth`, which asserts the invariant the
+whole thing turns on over a spread of shapes rather than one -- empty board,
+mono pedal, stereo pedal, either order, a pedal that widens or folds on its
+own, a generator, and three splits -- on both board widths: always two output
+buses, and always two *distinct* ones. "It works for the chain I tried" is what
+let this through the first time. Three existing checks changed to state the new
+behaviour, which is the honest record: they were right about the old one.
+
+`board_width` is the same claim end to end, against real plugins: the channel
+line reads `1 in / 2 out` on a mono board and `2 in / 2 out` on a stereo one,
+for a plain pedal and for a keyed stereo compressor (`urn:ardour:a-comp#stereo`,
+skipped when not installed) that the planner used to refuse outright.
 
 `RejoinSplit` and `RestoreSplit` moved out of `main.cpp` into
 `src/preset/SplitEdit.{h,cpp}` to make any of this checkable -- they are graph

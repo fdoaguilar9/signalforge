@@ -51,6 +51,18 @@ struct PortInfo
 	// value is how many samples of delay the plugin adds. There is at most
 	// one. Needed to keep the two lanes of a split time-aligned (SF-51).
 	bool reports_latency = false;
+
+	// lv2:isSideChain -- an audio input the plugin *listens* to rather than
+	// processes: a compressor's key input, a vocoder's modulator.
+	//
+	// **A sidechain is not a channel.** Counting one would make a mono
+	// compressor look like a stereo pedal, and on a stereo board the planner
+	// would then hand it the right channel as its key signal: the board would
+	// duck to whatever happens to be in one speaker. Worse, a stereo pedal
+	// with a key input reports three audio inputs and is refused outright as
+	// something this host cannot adapt. Both are the same mistake -- reading a
+	// port count as a channel count.
+	bool sidechain = false;
 };
 
 const char* ToString(PortType type);

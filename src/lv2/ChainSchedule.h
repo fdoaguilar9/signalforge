@@ -114,6 +114,17 @@ struct ChainPlan
 	uint32_t latency = 0;
 };
 
+// The board always presents two outputs, whatever the last pedal in the chain
+// happens to produce.
+//
+// **The board's width is a property of the board, not of what is plugged into
+// it.** A host registers its ports once and then swaps chains underneath them,
+// so a board whose edge moved every time a stereo pedal was added or removed
+// would refuse the swap and drop the edit -- which is exactly what it used to
+// do. Pinning the far end costs a mono chain two copies per block and buys back
+// the ability to put any pedal anywhere.
+inline constexpr unsigned kBoardOutputs = 2;
+
 // Returns false with a reason when the shape can't be built: a channel count
 // this host doesn't adapt (anything but 1 or 2), a split without exactly two
 // branches, or a stage-io list that doesn't match the spec's plugin count.

@@ -463,7 +463,7 @@ bool PlanChain(
 
 	out.input_buses = input.channels;
 
-	const Bus output = planner.PlanList(spec, input);
+	Bus output = planner.PlanList(spec, input);
 
 	if (planner.failed)
 	{
@@ -471,6 +471,11 @@ bool PlanChain(
 		out = ChainPlan();
 		return false;
 	}
+
+	// The far end of the board, pinned. A chain that already ends in stereo is
+	// handed straight back and costs nothing; a mono one gains two copies. Both
+	// widths are 1 or 2 here, so this cannot fail.
+	output = planner.Adapt(output, kBoardOutputs);
 
 	out.output_buses = output.channels;
 	out.latency = output.latency;

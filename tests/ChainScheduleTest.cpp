@@ -252,9 +252,10 @@ void TestLinear()
 	const sf::ChainSpec spec = {Plugin("a"), Plugin("b")};
 	const sf::ChainPlan plan = PlanOrFail(spec, {Io(1, 1), Io(1, 1)}, 1, "mono series");
 
-	Check(plan.ops.size() == 2, "a mono series is two Run ops and nothing else");
-	Check(CountOps(plan, sf::OpKind::Run) == 2, "...both of them Runs");
-	Check(plan.input_buses.size() == 1 && plan.output_buses.size() == 1, "a mono series is mono in, mono out");
+	Check(CountOps(plan, sf::OpKind::Run) == 2, "a mono series is two Run ops");
+	Check(plan.ops.size() == 4, "...and nothing else but the two copies that widen the board's output");
+	Check(plan.input_buses.size() == 1, "a mono board takes one input");
+	Check(plan.output_buses.size() == 2, "...and hands back two, whatever the last pedal produced");
 	Check(plan.stage_input_buses[1][0] == plan.stage_output_buses[0][0],
 		"one stage's output bus is the next one's input, with no copy between");
 	Check(plan.latency == 0, "plugins that report no latency add none");
@@ -270,7 +271,7 @@ void TestAdapters()
 	const sf::ChainPlan narrow = PlanOrFail({Plugin("stereo"), Plugin("mono")}, {Io(2, 2), Io(1, 1)}, 2,
 		"stereo pedal into a mono one");
 	Check(CountOps(narrow, sf::OpKind::Downmix) == 1, "stereo into mono folds down");
-	Check(narrow.output_buses.size() == 1, "...and the board ends up mono");
+	Check(narrow.stage_input_buses[1].size() == 1, "...and the mono pedal is handed one channel");
 
 	// The level question, which is the one that matters: a signal that goes
 	// mono -> stereo -> mono must come back at the level it went in. Summing
@@ -295,13 +296,94 @@ void TestAdapters()
 	CheckClose(folded[0], 0.5f, "a hard-panned signal folds to half");
 }
 
+// The board's edge does not move, whatever is on it.
+//
+// **This is the invariant the whole thing turns on, not a nice property.** A
+// host registers its ports once and swaps chains underneath them, so a board
+// that ended in two channels only when its last pedal happened to be stereo
+// would refuse the swap the moment a stereo pedal was added or removed -- which
+// is exactly the bug this exists to keep fixed. Asserted over a spread of
+// shapes rather than one, because "it works for the chain I tried" is what let
+// it through the first time.
+void TestBoardWidth()
+{
+	struct Case
+	{
+		const char* description;
+		sf::ChainSpec spec;
+		std::vector<sf::StageIo> io;
+	};
+
+	const std::vector<Case> cases = {
+		{"an empty board", {}, {}},
+		{"a mono pedal", {Plugin("a")}, {Io(1, 1)}},
+		{"a stereo pedal", {Plugin("a")}, {Io(2, 2)}},
+		{"a mono pedal after a stereo one", {Plugin("a"), Plugin("b")}, {Io(2, 2), Io(1, 1)}},
+		{"a stereo pedal after a mono one", {Plugin("a"), Plugin("b")}, {Io(1, 1), Io(2, 2)}},
+		{"a pedal that widens on its own", {Plugin("a")}, {Io(1, 2)}},
+		{"a pedal that folds on its own", {Plugin("a")}, {Io(2, 1)}},
+		{"a generator", {Plugin("a")}, {Io(0, 1)}},
+		{"a split of two mono lanes", {Split({Plugin("a")}, {Plugin("b")})}, {Io(1, 1), Io(1, 1)}},
+		{"a split with one stereo lane", {Split({Plugin("a")}, {Plugin("b")})}, {Io(1, 1), Io(2, 2)}},
+		{"a split with a dry lane", {Split({Plugin("a")}, {})}, {Io(2, 2)}},
+	};
+
+	for (unsigned board_inputs = 1; board_inputs <= 2; ++board_inputs)
+	{
+		for (const Case& item : cases)
+		{
+			char description[128];
+			std::snprintf(description, sizeof(description), "%s, %u in", item.description, board_inputs);
+
+			const sf::ChainPlan plan = PlanOrFail(item.spec, item.io, board_inputs, description);
+
+			Check(plan.input_buses.size() == board_inputs && plan.output_buses.size() == sf::kBoardOutputs,
+				description);
+		}
+	}
+
+	// And the board's two outputs are always two distinct buffers, even where
+	// nothing in the chain forced them apart. Two output ports that turned out
+	// to be the same buffer would have the engine hand the same pointer to
+	// JACK twice and lose a channel.
+	const sf::ChainPlan mono = PlanOrFail({Plugin("a")}, {Io(1, 1)}, 1, "a mono pedal on a mono board");
+	Check(mono.output_buses[0] != mono.output_buses[1], "the board's two outputs are two separate buffers");
+
+	const sf::ChainPlan empty = PlanOrFail({}, {}, 2, "an empty stereo board");
+	Check(empty.output_buses[0] != empty.output_buses[1], "...on an empty stereo board too");
+	Check(empty.output_buses[0] != empty.input_buses[0], "...and are not the input buffers either");
+}
+
 void TestSplit()
 {
 	sf::ChainSpec spec = {Split({Plugin("a")}, {Plugin("b")})};
 
 	const sf::ChainPlan plan = PlanOrFail(spec, {Io(1, 1), Io(1, 1)}, 1, "a split");
 	Check(CountOps(plan, sf::OpKind::Mix) == 1, "a mono split merges with one Mix");
-	Check(plan.ops.back().kind == sf::OpKind::Mix, "the merge is the last thing that happens");
+
+	// The merge is still the last thing that happens *to the signal*; what
+	// follows it is only the board widening its own output to two channels.
+	{
+		size_t mix_at = plan.ops.size();
+
+		for (size_t i = 0; i < plan.ops.size(); ++i)
+		{
+			if (plan.ops[i].kind == sf::OpKind::Mix)
+			{
+				mix_at = i;
+			}
+		}
+
+		bool only_widening_after = mix_at < plan.ops.size();
+
+		for (size_t i = mix_at + 1; i < plan.ops.size(); ++i)
+		{
+			only_widening_after = only_widening_after && plan.ops[i].kind == sf::OpKind::Copy;
+		}
+
+		Check(only_widening_after, "the merge is the last thing that happens to the signal");
+	}
+
 	Check(plan.stage_input_buses[0][0] == plan.stage_input_buses[1][0], "both lanes are fed the same signal");
 	Check(plan.stage_input_buses[0][0] == plan.input_buses[0], "...which is the board's input");
 
@@ -763,7 +845,20 @@ void TestSplitterModes()
 
 		Check(plan.stage_input_buses[0][0] == plan.input_buses[0], "lane A takes the left input");
 		Check(plan.stage_input_buses[1][0] == plan.input_buses[1], "lane B takes the right input");
-		Check(CountOps(plan, sf::OpKind::Copy) == 0, "...and neither is copied to get there");
+		// Against the board's inputs specifically: the copies that widen the
+		// board's *output* are always there and are not what this is about.
+		size_t copies_from_input = 0;
+
+		for (const sf::ChainOp& op : plan.ops)
+		{
+			if (op.kind == sf::OpKind::Copy &&
+				(op.src0 == plan.input_buses[0] || op.src0 == plan.input_buses[1]))
+			{
+				++copies_from_input;
+			}
+		}
+
+		Check(copies_from_input == 0, "...and neither is copied to get there");
 
 		// Numerically: left 1.0 and right 2.0 arrive in the lanes that asked
 		// for them and nowhere else.
@@ -835,6 +930,7 @@ int main()
 {
 	TestLinear();
 	TestAdapters();
+	TestBoardWidth();
 	TestSplit();
 	TestLatencyAlignment();
 	TestPassthroughAliasing();

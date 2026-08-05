@@ -358,9 +358,34 @@ Two adapters, and only two:
 
 Anything wider than stereo is **refused rather than guessed at**: there is no
 one right answer for what four channels into two should do, and silently
-picking one is worse than saying so. The board's own input width is a setting
-(`board_inputs`: auto, 1, or 2 — SF-52, SF-76), not a consequence of whichever
-pedal happens to be first.
+picking one is worse than saying so.
+
+A port count is not a channel count, though. An audio input marked
+`lv2:isSideChain` — a compressor's key input — is left out of the count and fed
+the same signal as the pedal's first real input, so it self-keys. Counting one
+would make a mono compressor look like a stereo pedal, and a *stereo*
+compressor look like something this host has to refuse.
+
+The board's own edges are fixed, and this is the part that matters most:
+
+- Its input width is a setting (`board_inputs`: auto, 1, or 2 — SF-52, SF-76),
+  resolved once at startup rather than re-read from whichever pedal is first.
+- Its output is **always two channels** (`kBoardOutputs`), whatever the last
+  pedal produces.
+
+**Neither end moves when the pedals change.** The engine registers JACK ports
+once and swaps chains underneath them, so a board whose edge followed its
+contents would refuse the swap — and drop the edit — the moment a stereo pedal
+was added or removed. That was a real bug: adding a two-channel plugin to a
+mono board failed with `Cannot switch: new chain is 1 in / 2 out, but the JACK
+ports are 1 in / 1 out` on the console and nothing useful on screen. Pinning
+the far end costs a mono board two copies per block and buys back the ability
+to put any pedal anywhere.
+
+It also retired the engine's one piece of channel adaptation: a mono board used
+to get a second JACK output `memcpy`'d from the first. That mirror carried no
+trim of its own and never reached the peak or clip meters. `out_2` is now a
+planned channel like any other.
 
 ## 8. UI
 

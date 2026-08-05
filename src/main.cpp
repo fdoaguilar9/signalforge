@@ -1550,6 +1550,26 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		return 1;
 	}
 
+	// The board's width, settled once and then never questioned again.
+	//
+	// `kAutoBoardInputs` means "as many as the first pedal wants", which is a
+	// fine way to *start* and a bad way to *stay*: resolved afresh on every
+	// rebuild, moving a stereo pedal to the head of the chain would move the
+	// board's own edge, and Start() has already registered JACK ports at the
+	// old width. Resolve it here, from the chain that is about to become those
+	// ports, and hand an explicit number to every rebuild from now on.
+	unsigned board_width = 0;
+
+	for (const sf::PortInfo& port : chain->Ports())
+	{
+		if (port.type == sf::PortType::Audio && port.direction == sf::PortDirection::Input)
+		{
+			++board_width;
+		}
+	}
+
+	board_width = std::max(1u, board_width);
+
 	if (!engine.Start(chain.get()))
 	{
 		engine.Close();
@@ -2086,8 +2106,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		sf::ChainBuildReport report;
 
 		std::unique_ptr<sf::Chain> next_chain = sf::BuildChainFromPreset(
-			world, next_preset, engine.SampleRate(), engine.MaxBlockSize(), urid_map, error, &report,
-			settings.audio.board_inputs);
+			world, next_preset, engine.SampleRate(), engine.MaxBlockSize(), urid_map, error, &report, board_width);
 
 		const auto build_ms =
 			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - build_start)
@@ -2107,8 +2126,11 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		// Equal-power crossfade: both chains run for a few ms and are mixed,
 		// so the transition is smooth rather than a click or a gap.
 		// --no-crossfade takes the raw path, for comparing the two.
-		const bool switched =
-			use_crossfade ? engine.SwitchHost(next_chain.get()) : engine.SwapHost(next_chain.get());
+		// `error` rather than a fresh string: the caller reports it, and a
+		// refused swap that left the previous build's message in there was how
+		// "Could not apply that change:" came to be followed by nothing at all.
+		const bool switched = use_crossfade ? engine.SwitchHost(next_chain.get(), &error)
+										   : engine.SwapHost(next_chain.get(), &error);
 
 		if (!switched)
 		{
@@ -2276,6 +2298,14 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 		// call at.
 		double chain_sample_rate = engine.SampleRate();
 
+		// And the width it is currently built for, tracked beside the rate for
+		// exactly the same reason: a forward attempt that rebuilt at a new
+		// width and then failed at Start() leaves `chain` at that width, and a
+		// fallback that compared against the width the *board* is running at
+		// would decide no rebuild was needed and come up with ports it cannot
+		// match.
+		unsigned chain_width = board_width;
+
 		auto bring_up = [&](const sf::AudioConfig& config, std::string& reason) -> bool
 		{
 			if (!jack_server.EnsureRunning(config, reason))
@@ -2301,14 +2331,21 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 			// engine registers one JACK port per chain input, so a board that
 			// went from mono to stereo has to be re-planned before it is
 			// started or it will come up with the port count it had before.
-			const bool width_changed = config.board_inputs != settings.audio.board_inputs;
+			//
+			// Compared as resolved widths, not as raw settings: "auto" and "1"
+			// are different numbers that mean the same board, and rebuilding
+			// between them would be work for nothing.
+			const unsigned requested_width =
+				config.board_inputs == sf::kAutoBoardInputs ? board_width : config.board_inputs;
+
+			const bool width_changed = requested_width != chain_width;
 
 			if (std::fabs(engine.SampleRate() - chain_sample_rate) > 0.5 || width_changed)
 			{
 				sf::ChainBuildReport report;
 				std::unique_ptr<sf::Chain> rebuilt = sf::BuildChainFromPreset(
 					world, current_source, engine.SampleRate(), engine.MaxBlockSize(), urid_map, reason, &report,
-					config.board_inputs);
+					requested_width);
 
 				if (!rebuilt)
 				{
@@ -2319,9 +2356,9 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 
 				chain = std::move(rebuilt);
 				chain_sample_rate = engine.SampleRate();
+				chain_width = requested_width;
 				missing_plugins = report.skipped_uris;
 				collapsed_splits = report.collapsed_splits;
-			collapsed_splits = report.collapsed_splits;
 				skipped_indices = report.skipped_indices;
 #ifdef SIGNALFORGE_GUI
 				stage_statics_valid = false;
@@ -2335,6 +2372,13 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				jack_server.Stop();
 				return false;
 			}
+
+			// Ports have just been registered from this chain, so its width is
+			// the one every later rebuild has to match. Settled here for the
+			// same reason it was settled at startup, and on the fallback
+			// attempt too -- coming back up on the *previous* config means
+			// coming back up at the previous width.
+			board_width = chain_width;
 
 			engine.ConnectAudioPorts(config.input_ports, config.output_ports);
 
@@ -3251,18 +3295,10 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 			view.metronome.binding = metronome_binding;
 			view.metronome.tempo_binding = tempo_binding;
 
-			// What the board is *actually* taking in, not what was configured:
-			// `kAutoBoardInputs` means "as many as the first pedal wants", and
-			// the splitter card's stereo caveat is about the real number.
-			view.board_inputs = static_cast<unsigned>(chain->Ports().empty() ? 1 : 0);
-
-			for (const sf::PortInfo& port : chain->Ports())
-			{
-				if (port.type == sf::PortType::Audio && port.direction == sf::PortDirection::Input)
-				{
-					++view.board_inputs;
-				}
-			}
+			// What the board is *actually* taking in, not what the config
+			// spells: `kAutoBoardInputs` is a shorthand, and the splitter
+			// card's stereo caveat is about the real number.
+			view.board_inputs = board_width;
 
 			view.bank_name = library.CurrentBankName();
 			view.banks = &board_banks;
@@ -3477,9 +3513,8 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				// state a two-item control can show. The dialog opens on what
 				// the board is *actually* taking, so what it offers to change
 				// is the truth rather than the shorthand.
-				audio_settings_view.board_inputs = settings.audio.board_inputs != 0
-					? settings.audio.board_inputs
-					: std::max(1u, view.board_inputs);
+				audio_settings_view.board_inputs =
+					settings.audio.board_inputs != 0 ? settings.audio.board_inputs : board_width;
 
 				for (size_t i = 0; i < audio_settings_devices.size(); ++i)
 				{
@@ -3528,7 +3563,13 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 				// Changing how wide the board's input is changes the chain
 				// itself -- a different number of input ports means a different
 				// plan -- so it is never a re-patch, however little else moved.
-				const bool same_width = requested.board_inputs == settings.audio.board_inputs;
+				//
+				// Against the width the board is *running* at, not the one the
+				// file asked for: a config that says "auto" and a dialog that
+				// says "mono" describe the same board, and restarting the
+				// server to move between two spellings of one number would be
+				// an audible gap for no change at all.
+				const bool same_width = requested.board_inputs == board_width;
 
 				// Re-pointing the board at different hardware is a change of
 				// *patching*, not of the engine or the server -- so when
@@ -3565,7 +3606,7 @@ int RunPreset(const std::string& query, const std::string& preset_dir, const Run
 
 					std::unique_ptr<sf::Chain> resized = sf::BuildChainFromPreset(
 						world, current_source, engine.SampleRate(), safe_block, urid_map, rebuild_error, &report,
-						settings.audio.board_inputs);
+						board_width);
 
 					if (!resized)
 					{

@@ -140,6 +140,34 @@ void CountAudioPorts(const AudioHost& host, size_t& inputs, size_t& outputs)
 	}
 }
 
+// The one refusal both host swaps can hit, worded in a single place so the
+// player and the console are told the same thing.
+bool PortLayoutMatches(const AudioHost& next, size_t inputs, size_t outputs, std::string* reason)
+{
+	size_t next_inputs = 0;
+	size_t next_outputs = 0;
+	CountAudioPorts(next, next_inputs, next_outputs);
+
+	if (next_inputs == inputs && next_outputs == outputs)
+	{
+		return true;
+	}
+
+	char message[160];
+	std::snprintf(message, sizeof(message),
+		"Cannot switch: new chain is %zu in / %zu out, but the JACK ports are %zu in / %zu out.", next_inputs,
+		next_outputs, inputs, outputs);
+
+	std::fprintf(stderr, "%s\n", message);
+
+	if (reason)
+	{
+		*reason = message;
+	}
+
+	return false;
+}
+
 }  // namespace
 
 bool JackEngine::Start(AudioHost* host)
@@ -177,12 +205,6 @@ bool JackEngine::Start(AudioHost* host)
 	if (!midi_in_)
 	{
 		std::fprintf(stderr, "Warning: could not register a MIDI input port; MIDI control is unavailable.\n");
-	}
-
-	if (outputs_.size() == 1)
-	{
-		jack_port_t* mirror_port = jack_port_register(client_, "out_2", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
-		mirrors_.push_back({0, mirror_port});
 	}
 
 	jack_set_process_callback(client_, &JackEngine::ProcessCallback, this);
@@ -388,25 +410,12 @@ std::vector<std::string> JackEngine::ConnectAudioPorts(const std::string& input_
 		}
 	}
 
-	// Hardware playback ports are JACK *inputs*; our out_N ports (including
-	// the mono->stereo mirror) feed them.
+	// Hardware playback ports are JACK *inputs*; our out_N ports feed them.
 	const std::vector<std::string> playback_ports = find_physical(JackPortIsInput, output_filter);
 
-	std::vector<jack_port_t*> our_outputs;
-
-	for (const AudioPortBinding& binding : outputs_)
+	for (size_t i = 0; i < outputs_.size() && i < playback_ports.size(); ++i)
 	{
-		our_outputs.push_back(binding.jack_port);
-	}
-
-	for (const MirrorBinding& mirror : mirrors_)
-	{
-		our_outputs.push_back(mirror.jack_port);
-	}
-
-	for (size_t i = 0; i < our_outputs.size() && i < playback_ports.size(); ++i)
-	{
-		const char* our_name = jack_port_name(our_outputs[i]);
+		const char* our_name = jack_port_name(outputs_[i].jack_port);
 		const int result = jack_connect(client_, our_name, playback_ports[i].c_str());
 
 		if (result == 0 || result == EEXIST)
@@ -526,11 +535,6 @@ void JackEngine::DisconnectAudioPorts()
 	{
 		jack_port_disconnect(client_, binding.jack_port);
 	}
-
-	for (const MirrorBinding& mirror : mirrors_)
-	{
-		jack_port_disconnect(client_, mirror.jack_port);
-	}
 }
 
 void JackEngine::SetCrossfade(double milliseconds, CrossfadeCurve curve)
@@ -541,19 +545,11 @@ void JackEngine::SetCrossfade(double milliseconds, CrossfadeCurve curve)
 	crossfade_.Configure(client_ ? SampleRate() : 0.0, milliseconds, curve);
 }
 
-bool JackEngine::SwitchHost(AudioHost* next)
+bool JackEngine::SwitchHost(AudioHost* next, std::string* reason)
 {
 	// Check compatibility first: a rejected switch shouldn't disturb audio.
-	size_t next_inputs = 0;
-	size_t next_outputs = 0;
-	CountAudioPorts(*next, next_inputs, next_outputs);
-
-	if (next_inputs != inputs_.size() || next_outputs != outputs_.size())
+	if (!PortLayoutMatches(*next, inputs_.size(), outputs_.size(), reason))
 	{
-		std::fprintf(stderr,
-			"Cannot switch: new chain is %zu in / %zu out, but the JACK ports are %zu in / %zu out.\n", next_inputs,
-			next_outputs, inputs_.size(), outputs_.size());
-
 		return false;
 	}
 
@@ -595,18 +591,10 @@ bool JackEngine::WaitForCrossfade(unsigned timeout_ms)
 	return incoming_.load(std::memory_order_acquire) == nullptr;
 }
 
-bool JackEngine::SwapHost(AudioHost* next)
+bool JackEngine::SwapHost(AudioHost* next, std::string* reason)
 {
-	size_t next_inputs = 0;
-	size_t next_outputs = 0;
-	CountAudioPorts(*next, next_inputs, next_outputs);
-
-	if (next_inputs != inputs_.size() || next_outputs != outputs_.size())
+	if (!PortLayoutMatches(*next, inputs_.size(), outputs_.size(), reason))
 	{
-		std::fprintf(stderr,
-			"Cannot switch: new chain is %zu in / %zu out, but the JACK ports are %zu in / %zu out.\n", next_inputs,
-			next_outputs, inputs_.size(), outputs_.size());
-
 		return false;
 	}
 
@@ -690,7 +678,6 @@ void JackEngine::Close()
 
 	inputs_.clear();
 	outputs_.clear();
-	mirrors_.clear();
 	outgoing_scratch_.clear();
 	incoming_scratch_.clear();
 	midi_in_ = nullptr;
@@ -938,9 +925,8 @@ int JackEngine::Process(jack_nframes_t nframes)
 		}
 	}
 
-	// The output trim, before the mirrors copy and before the meter reads --
-	// so a mirrored channel carries the same level as the one it mirrors, and
-	// the meter and the clip light describe what actually leaves the machine.
+	// The output trim, before the meter reads -- so the meter and the clip
+	// light describe what actually leaves the machine.
 	//
 	// In place, unlike the input's: these buffers are ours to write.
 	const float output_gain_target = output_gain_.load(std::memory_order_relaxed);
@@ -958,7 +944,7 @@ int JackEngine::Process(jack_nframes_t nframes)
 	// gain staging therefore cannot change how loud it is -- a metronome that
 	// got quieter when you turned the amp down would be one more thing to
 	// fight mid-song -- and it can never reach the tuner, which listens to the
-	// input. Before the mirrors, so a mirrored channel carries it too.
+	// input.
 	if (metronome_)
 	{
 		float* left = outputs_.empty()
@@ -970,15 +956,6 @@ int JackEngine::Process(jack_nframes_t nframes)
 			: nullptr;
 
 		metronome_->Mix(left, right, nframes);
-	}
-
-	for (const MirrorBinding& mirror : mirrors_)
-	{
-		const float* source =
-			static_cast<const float*>(jack_port_get_buffer(outputs_[mirror.source_output_index].jack_port, nframes));
-		float* dest = static_cast<float*>(jack_port_get_buffer(mirror.jack_port, nframes));
-
-		std::memcpy(dest, source, nframes * sizeof(float));
 	}
 
 	// Measured last, on the buffers actually going to the interface: after

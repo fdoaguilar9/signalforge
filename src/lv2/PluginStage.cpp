@@ -120,9 +120,13 @@ std::unique_ptr<PluginStage> PluginStage::Create(
 	stage->audio_buffers_.assign(port_count, nullptr);
 
 	// Cached so the bypass path in Run() does no searching per block.
+	//
+	// Sidechains are not in these lists: bypass passes the signal through, and
+	// a compressor's key input is not signal. Counting one would make bypassing
+	// a mono compressor with a key input send the key to the output.
 	for (const PortInfo& port : stage->ports_)
 	{
-		if (port.type != PortType::Audio)
+		if (port.type != PortType::Audio || port.sidechain)
 		{
 			continue;
 		}

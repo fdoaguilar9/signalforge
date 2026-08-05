@@ -21,13 +21,16 @@ namespace sf
 // same count/order. Works the same whether the host is a single PluginStage
 // or a multi-stage Chain.
 //
-// One adaptation is applied automatically: if the host's audio *output* is
-// mono (exactly one output port), a second JACK output port is registered
-// and fed a copy of the same signal, so a mono amp+IR chain still gives a
-// normal stereo pair to connect in a DAW. Anything else (a host with 2+
-// outputs already, or mismatched input counts) is passed through as-is --
-// this is deliberately just the one final-output special case, not a
-// general N-to-M channel mixer.
+// No channel adaptation happens here, and none is needed: a Chain plans its own
+// edges, always ending in two outputs (kBoardOutputs), so a mono amp+IR board
+// already hands over a normal stereo pair. This used to be a special case --
+// one output port got a second, mirrored one memcpy'd after Run() -- and that
+// mirror was worse than the real thing in every way that showed: it carried no
+// gain trim of its own, never reached the peak or clip meters, and existed only
+// on boards that happened to end in mono.
+//
+// Ports are registered once, in Start(), and every later host swap must present
+// the same count. That is what SwitchHost/SwapHost check.
 class JackEngine
 {
 public:
@@ -57,7 +60,11 @@ public:
 	//
 	// Note both chains process audio during the fade, so CPU load briefly
 	// roughly doubles.
-	bool SwitchHost(AudioHost* next);
+	//
+	// `reason` receives the refusal text when this returns false, so a caller
+	// can put it in front of the player instead of leaving it on stderr where
+	// only someone who started the board from a terminal will ever see it.
+	bool SwitchHost(AudioHost* next, std::string* reason = nullptr);
 
 	// How long a SwitchHost() crossfade lasts, and the shape of its ramp.
 	// Call before Start(): the length is turned into a per-sample step there,
@@ -76,11 +83,12 @@ public:
 	//
 	// Returns false, changing nothing, if `next` doesn't have the same audio
 	// port layout as the host passed to Start(): JACK ports are registered
-	// once and can't be reshuffled underneath a running graph.
+	// once and can't be reshuffled underneath a running graph. `reason`
+	// receives that refusal text, as in SwitchHost().
 	//
 	// The previous host is *not* freed here -- the audio thread may still be
 	// mid-cycle with it. Use WaitForProcessCycles() before destroying it.
-	bool SwapHost(AudioHost* next);
+	bool SwapHost(AudioHost* next, std::string* reason = nullptr);
 
 	// Blocks until the audio thread has completed `cycles` more process
 	// callbacks, so a host retired by SwapHost() is provably no longer in
@@ -232,10 +240,9 @@ public:
 
 	// Connects our registered audio ports to physical hardware ports (SF-39):
 	// our in_N ports to hardware capture ports, our out_N ports to hardware
-	// playback ports (the mono->stereo mirror port included). Matched by
-	// position after sorting by name, bounded by however many of each exist
-	// on either side -- a two-in pedalboard on a four-in interface gets the
-	// first two capture ports, not all four.
+	// playback ports. Matched by position after sorting by name, bounded by
+	// however many of each exist on either side -- a two-in pedalboard on a
+	// four-in interface gets the first two capture ports, not all four.
 	//
 	// An empty filter matches every physical port of the right direction,
 	// same convention as ConnectMidiInputs. A non-empty one is a
@@ -379,18 +386,6 @@ private:
 
 	std::vector<AudioPortBinding> inputs_;
 	std::vector<AudioPortBinding> outputs_;
-
-	// A mono->stereo duplicate: mirrors outputs_[source_output_index]'s
-	// buffer into an extra JACK port after Run(), rather than connecting the
-	// plugin port to it directly (a plugin port can only be connected to one
-	// buffer per block).
-	struct MirrorBinding
-	{
-		size_t source_output_index;
-		jack_port_t* jack_port;
-	};
-
-	std::vector<MirrorBinding> mirrors_;
 };
 
 }  // namespace sf

@@ -273,6 +273,18 @@ add_test(NAME split_routing
 )
 set_tests_properties(split_routing PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED")
 
+# The board presents the same port count whatever is on it -- the invariant the
+# JACK engine's registered-once ports depend on. Planned width is asserted in
+# chain_schedule_test; this checks what a real built chain hands over.
+add_test(NAME board_width
+	COMMAND ${CMAKE_COMMAND}
+		-DSIGNALFORGE=$<TARGET_FILE:signalforge>
+		-DPLUGIN_URI=http://kxstudio.sf.net/carla/plugins/audiogain
+		-DSIDECHAIN_URI=urn:ardour:a-comp#stereo
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunBoardWidthTest.cmake
+)
+set_tests_properties(board_width PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED")
+
 add_test(NAME bypass
 	COMMAND ${CMAKE_COMMAND}
 		-DSIGNALFORGE=$<TARGET_FILE:signalforge>

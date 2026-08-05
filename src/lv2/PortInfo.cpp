@@ -45,6 +45,11 @@ public:
 		, reports_latency_(lilv_new_uri(world, LV2_CORE__reportsLatency))
 		, designation_(lilv_new_uri(world, LV2_CORE__designation))
 		, latency_(lilv_new_uri(world, LV2_CORE__latency))
+		// lv2:isSideChain, spelled out because this lv2 release has no
+		// LV2_CORE__isSideChain macro for it. Note it is core, not port-groups
+		// -- pg: has sideChainOf, which is a different thing (a relation to a
+		// group) and not what plugins in the wild actually mark ports with.
+		, side_chain_(lilv_new_uri(world, LV2_CORE_PREFIX "isSideChain"))
 	{
 	}
 
@@ -63,6 +68,7 @@ public:
 		lilv_node_free(reports_latency_);
 		lilv_node_free(designation_);
 		lilv_node_free(latency_);
+		lilv_node_free(side_chain_);
 	}
 
 	ClassNodes(const ClassNodes&) = delete;
@@ -88,6 +94,9 @@ public:
 	LilvNode* reports_latency_;
 	LilvNode* designation_;
 	LilvNode* latency_;
+
+	// lv2:isSideChain. Not a channel: see the note on PortInfo::sidechain.
+	LilvNode* side_chain_;
 };
 
 }  // namespace
@@ -126,6 +135,7 @@ std::vector<PortInfo> ClassifyPorts(LilvWorld* world, const LilvPlugin* plugin)
 		if (lilv_port_is_a(plugin, port, classes.audio_))
 		{
 			info.type = PortType::Audio;
+			info.sidechain = lilv_port_has_property(plugin, port, classes.side_chain_);
 		}
 		else if (lilv_port_is_a(plugin, port, classes.control_))
 		{

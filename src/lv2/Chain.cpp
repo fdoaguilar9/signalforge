@@ -15,14 +15,33 @@ static_assert(std::atomic<float>::is_always_lock_free, "merge gains are read fro
 namespace
 {
 
-// Audio ports of `stage` with the given direction, in port-index order.
+// The signal-carrying audio ports of `stage` with the given direction, in
+// port-index order. Sidechains are left out: they are not channels, and the
+// size of this list is what the planner reads as the stage's width.
 std::vector<uint32_t> AudioPortIndices(const PluginStage& stage, PortDirection direction)
 {
 	std::vector<uint32_t> indices;
 
 	for (const PortInfo& port : stage.Ports())
 	{
-		if (port.type == PortType::Audio && port.direction == direction)
+		if (port.type == PortType::Audio && port.direction == direction && !port.sidechain)
+		{
+			indices.push_back(port.index);
+		}
+	}
+
+	return indices;
+}
+
+// The sidechain inputs left out above, so they can still be connected to
+// something real.
+std::vector<uint32_t> SidechainPortIndices(const PluginStage& stage)
+{
+	std::vector<uint32_t> indices;
+
+	for (const PortInfo& port : stage.Ports())
+	{
+		if (port.type == PortType::Audio && port.direction == PortDirection::Input && port.sidechain)
 		{
 			indices.push_back(port.index);
 		}
@@ -215,6 +234,24 @@ std::unique_ptr<Chain> Chain::Create(LilvWorld* world, const ChainSpec& spec, do
 			const uint32_t bus = output_buses[ch];
 			chain->bus_bindings_[bus].push_back({static_cast<uint32_t>(s), outputs[ch]});
 			stage.ConnectAudioPort(outputs[ch], chain->bus_ptr_[bus]);
+		}
+
+		// Sidechains, fed the same signal as the stage's first real input.
+		//
+		// Self-keying: what a compressor on a pedalboard is expected to do, and
+		// the only signal a board like this has to offer -- there is nowhere for
+		// a separate key input to come from. Left alone they would stay on
+		// PluginStage's scratch, which is silence, and a compressor keyed off
+		// silence never compresses. A generator has no input to borrow, so its
+		// sidechains keep the silence.
+		if (!input_buses.empty())
+		{
+			for (uint32_t sidechain : SidechainPortIndices(stage))
+			{
+				const uint32_t bus = input_buses[0];
+				chain->bus_bindings_[bus].push_back({static_cast<uint32_t>(s), sidechain});
+				stage.ConnectAudioPort(sidechain, chain->bus_ptr_[bus]);
+			}
 		}
 	}
 
